@@ -5,8 +5,10 @@
 ## 安装
 
 ```bash
-npx -y github:decent-yu/cc-otel-setup url=你的服务器地址
+npx -y cc-otel-installer url=你的服务器地址
 ```
+
+> 国内网络慢可以临时切到淘宝镜像：`npm config set registry https://registry.npmmirror.com`，再执行上面的命令。
 
 把 `你的服务器地址` 替换成团队提供的实际地址（例如 `url=10.20.30.40`）。具体地址请向团队负责人索取。
 

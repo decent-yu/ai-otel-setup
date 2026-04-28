@@ -3,10 +3,10 @@
  * cc-otel-installer
  *
  * 一行命令配置 Claude Code OTel 上报：
- *   npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST
+ *   npx -y cc-otel-installer url=COLLECTOR_HOST
  *
  * 兼容写法：参数也可以全部塞在一个 argv 里，用逗号分隔：
- *   npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST
+ *   npx -y cc-otel-installer url=COLLECTOR_HOST
  *
  * 该 installer **不走 CC plugin 机制**：直接把 hook 脚本铺到
  * ~/.claude/cc-otel/，并把 12 个 OTel env + SessionStart hook 注入
@@ -223,7 +223,7 @@ function main() {
 
 function printUsage() {
   console.log(`Usage:
-  npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST
+  npx -y cc-otel-installer url=COLLECTOR_HOST
 
 参数（必填）：
   url    Collector host（裸 IP/域名，自动补 http://...:4317；也可传完整 URL）

@@ -1,23 +1,42 @@
 {
   "name": "cc-otel-installer",
   "version": "1.0.0",
-  "description": "iFlyTek BG 一键配置 Claude Code OTel 上报：settings/hooks/SDK 一行命令到位。",
+  "description": "One-shot installer for Claude Code OpenTelemetry forwarding. Writes settings.json env + SessionStart hook + collector endpoint in a single npx command.",
   "bin": {
     "cc-otel-installer": "./cli.js"
   },
   "main": "./cli.js",
+  "preferGlobal": true,
   "engines": {
     "node": ">=14"
   },
   "files": [
     "cli.js",
     "templates/",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
-  "license": "Proprietary-Internal",
-  "author": {
-    "name": "iFlyTek BG Productivity",
-    "email": "productivity@iflytek.example"
+  "license": "MIT",
+  "author": "iFlyTek BG Productivity <productivity@iflytek.example>",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "observability",
+    "opentelemetry",
+    "otel",
+    "telemetry",
+    "installer",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/decent-yu/cc-otel-setup.git"
   },
-  "keywords": ["claude-code", "observability", "otel", "installer"]
+  "bugs": {
+    "url": "https://github.com/decent-yu/cc-otel-setup/issues"
+  },
+  "homepage": "https://github.com/decent-yu/cc-otel-setup#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }
