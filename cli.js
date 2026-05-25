@@ -2,7 +2,7 @@
 /**
  * ai-otel-setup
  *
- * 一行命令配置 Claude Code OTel 上报：
+ * 一行命令配置 Claude Code / Codex CLI / Gemini CLI / OpenCode OTel 上报：
  *   npx -y ai-otel-setup url=COLLECTOR_HOST
  *
  * 兼容写法：参数也可以全部塞在一个 argv 里，用逗号分隔：
@@ -696,6 +696,21 @@ function installGemini(home, endpoint) {
   return { tool: "gemini", status: "installed", path: settingsPath, backup: bak };
 }
 
+function installOpenCode(home, endpoint) {
+  const opencodeDir = process.env.OPENCODE_CONFIG_DIR || path.join(home, ".config", "opencode");
+  if (!fs.existsSync(opencodeDir)) {
+    return { tool: "opencode", status: "skipped", reason: "未检测到 ~/.config/opencode" };
+  }
+  const installDir = path.join(opencodeDir, "ai-otel");
+  const pluginDir = path.join(opencodeDir, "plugins");
+  const pluginDest = path.join(pluginDir, "ai-otel-setup.mjs");
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "templates", "opencode", "plugin.mjs"), pluginDest);
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
+  return { tool: "opencode", status: "installed", path: pluginDest };
+}
+
 // ---------- 主流程 ----------
 
 async function main() {
@@ -803,6 +818,11 @@ async function main() {
   } catch (e) {
     results.push({ tool: "gemini", status: "failed", reason: e.message });
   }
+  try {
+    results.push(installOpenCode(home, endpoint));
+  } catch (e) {
+    results.push({ tool: "opencode", status: "failed", reason: e.message });
+  }
 
   const debug = !!args.debug || process.argv.includes("--debug") || process.argv.includes("-d");
   const allResults = [{ tool: "claude", status: "installed" }, ...results];
@@ -820,7 +840,7 @@ async function main() {
     if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);
   }
   console.log("");
-  console.log("接下来：直接运行 `claude` / `codex` / `gemini`，下次会话启动即自动上报。");
+  console.log("接下来：直接运行 `claude` / `codex` / `gemini` / `opencode`，下次会话启动即自动上报。");
   if (debug) {
     console.log(
       "卸载：删除 " +
