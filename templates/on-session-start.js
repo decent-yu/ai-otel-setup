@@ -32,6 +32,7 @@ const os = require("os");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
 const { URL } = require("url");
 
 // UserPromptSubmit 节流窗口：2 分钟
@@ -103,6 +104,11 @@ function safeGit(args) {
   }
 }
 
+function markerFile(prefix, id) {
+  const digest = crypto.createHash("sha256").update(String(id || "")).digest("hex").slice(0, 32);
+  return `${prefix}-${digest}.flag`;
+}
+
 // -------- 主流程 ----------
 
 (async () => {
@@ -123,7 +129,7 @@ function safeGit(args) {
     // 兜底路径节流：sid 维度 2 分钟最多一次（marker 文件 mtime 判断）。
     // 失败重试窗口同时由此控制：marker 过期后允许下次 prompt 再发一次。
     const stateDir = path.join(os.homedir(), ".claude", "cc-otel-state");
-    const markerPath = sessionId ? path.join(stateDir, `sent-${sessionId}.flag`) : null;
+    const markerPath = sessionId ? path.join(stateDir, markerFile("sent", sessionId)) : null;
     if (isPromptFallback && markerPath && fs.existsSync(markerPath)) {
       try {
         const mtime = fs.statSync(markerPath).mtimeMs;

@@ -25,7 +25,7 @@ npx -y ai-otel-setup url=你的服务器地址
 ## 装好后会做什么
 
 - 在 `~/.claude/cc-otel/` 放一个启动脚本
-- 备份你原来的 `~/.claude/settings.json`（带时间戳，可随时还原）
+- 备份你原来的 `~/.claude/settings.json` 为 `settings.json.bak.<timestamp>`（可随时还原）
 - 把上报相关配置写进 `~/.claude/settings.json`
 
 你原本的其他设置都会保留；重复运行不会产生重复条目，可以放心重装。

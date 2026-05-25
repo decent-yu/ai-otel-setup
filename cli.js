@@ -14,7 +14,7 @@
  *
  * 关键约束：
  *   - 失败时尽量给出可操作信息，不静默
- *   - settings.json 写之前会备份到 settings.json.bak（每次覆盖，仅保留上一份）
+ *   - settings.json 写之前会备份到 settings.json.bak.<timestamp>
  *   - 多次运行幂等（按 hook id=team:session-start 去重）
  *   - 不依赖任何运行时第三方包，只用 Node 标准库
  */
@@ -409,7 +409,12 @@ function writeJSONAtomic(p, obj) {
 
 function backup(p) {
   if (!fs.existsSync(p)) return null;
-  const bak = `${p}.bak`;
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  let bak = `${p}.bak.${stamp}`;
+  let i = 1;
+  while (fs.existsSync(bak)) {
+    bak = `${p}.bak.${stamp}.${i++}`;
+  }
   fs.copyFileSync(p, bak);
   return bak;
 }
@@ -585,7 +590,8 @@ function ensureFeaturesHooksTrue(text) {
   return text.trimEnd() + "\n\n[features]\nhooks = true\n";
 }
 
-function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
+function buildCodexManagedBlock(endpoint, hookDest, launcherDest, options = {}) {
+  const includeOtelHeader = options.includeOtelHeader !== false;
   // exporter / trace_exporter / metrics_exporter 是 externally-tagged enum：
   //   - 写 scalar `exporter = "otlp-grpc"`：codex 解析为 unit variant，因为
   //     OtlpGrpc 是 struct variant（带 endpoint 等字段），报
@@ -595,12 +601,8 @@ function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
   //     OtlpGrpc { endpoint }，tag 来自 key 名。
   // 官方 sample 之所以能 `exporter = "none"`，是因为 None 本身就是 unit variant。
   // [features].hooks = true 由 ensureFeaturesHooksTrue 写到用户块里，避免重复声明 [features]
-  return [
+  const lines = [
     CODEX_MANAGED_BEGIN,
-    "[otel]",
-    'environment = "prod"',
-    "log_user_prompt = false",
-    "",
     '[otel.exporter."otlp-grpc"]',
     `endpoint = ${JSON.stringify(endpoint)}`,
     "",
@@ -617,7 +619,11 @@ function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
     'type = "command"',
     `command = ${JSON.stringify(buildHookCommand(launcherDest, hookDest))}`,
     CODEX_MANAGED_END,
-  ].join("\n");
+  ];
+  if (includeOtelHeader) {
+    lines.splice(1, 0, "[otel]", 'environment = "prod"', "log_user_prompt = false", "");
+  }
+  return lines.join("\n");
 }
 
 function installCodex(home, endpoint) {
@@ -640,12 +646,15 @@ function installCodex(home, endpoint) {
   existing = stripLegacyCodexOtel(existing);
   existing = stripLegacyCodexHook(existing);
   existing = stripLegacyCodexHooksFlag(existing);
+  const hasTopLevelOtel = /^\s*\[otel\]\s*$/m.test(existing);
   existing = ensureFeaturesHooksTrue(existing);
 
   // hook 同目录的 endpoint.json：hook 脚本运行时读它拿 logs endpoint，避免依赖
   // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
   writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
-  const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest);
+  const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest, {
+    includeOtelHeader: !hasTopLevelOtel,
+  });
   const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
   return { tool: "codex", status: "installed", path: configPath, backup: bak };

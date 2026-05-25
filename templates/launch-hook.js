@@ -114,6 +114,8 @@ function runAutoUpdate(installDir) {
 }
 
 function maybeSpawnAutoUpdate(nodeBin, installDir) {
+  if (process.env.AI_OTEL_ENABLE_AUTO_UPDATE !== "1") return;
+
   const cfgPath = path.join(installDir, "endpoint.json");
   if (!fs.existsSync(cfgPath)) return;
 
