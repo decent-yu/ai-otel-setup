@@ -7,6 +7,7 @@ const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
 const { URL } = require("url");
 
 function readStdin() {
@@ -25,6 +26,11 @@ function safeGit(args) {
   } catch (_) {
     return "";
   }
+}
+
+function seenFile(id) {
+  const digest = crypto.createHash("sha256").update(String(id || "")).digest("hex").slice(0, 32);
+  return `.session-seen.${digest}`;
 }
 
 // 解析 OTLP/HTTP logs endpoint。优先级：env 覆盖 → installer 写在 hook 同目录的
@@ -47,7 +53,7 @@ function endpoint() {
     try { input = JSON.parse(raw || "{}"); } catch (_) {}
     const conversation = input.conversation || {};
     const sid = conversation.id || input.conversation_id || input.session_id || "";
-    const seen = path.join(os.homedir(), ".codex", "ai-otel", `.session-seen.${sid || "unknown"}`);
+    const seen = path.join(os.homedir(), ".codex", "ai-otel", seenFile(sid || "unknown"));
     if (sid && fs.existsSync(seen)) process.exit(0);
     // 注意：seen 文件必须在 OTLP 发送成功后才写——见下方 res.on("end")。
     // 之前在此处直接写盘，会导致 collector 暂时不可用时第一次失败也被记为

@@ -23,6 +23,7 @@ node --check cli.js
 node --check templates/on-session-start.js
 node --check templates/codex/on-session-start.js
 node --check templates/gemini/on-session-start.js
+node --check templates/launch-hook.js
 ```
 
 Run a dry pack check:
@@ -119,4 +120,3 @@ After the workflow succeeds, confirm npm:
 ```bash
 npm view ai-otel-setup@1.0.12 version
 ```
-
