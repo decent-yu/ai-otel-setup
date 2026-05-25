@@ -814,6 +814,7 @@ async function main() {
   console.log("");
   console.log(`  ${"version".padEnd(12)}: ${PKG_VERSION}`);
   console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
+  console.log(`  ${"git email".padEnd(12)}: ${gitUser.email}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
