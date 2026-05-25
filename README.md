@@ -1,6 +1,6 @@
 # AI CLI 上报工具
 
-一键开通团队的 Claude Code / Codex CLI / Gemini CLI 使用数据上报。
+一键开通团队的 Claude Code / Codex CLI / Gemini CLI / OpenCode 使用数据上报。
 
 ## 安装
 
@@ -14,7 +14,7 @@ npx -y ai-otel-setup url=你的服务器地址
 
 把 `你的服务器地址` 替换成团队提供的实际地址（例如 `url=10.20.30.40`）。具体地址请向团队负责人索取。
 
-装好后直接运行 `claude` / `codex` / `gemini`，上报会自动开始，无需任何额外配置。
+装好后直接运行 `claude` / `codex` / `gemini` / `opencode`，上报会自动开始，无需任何额外配置。
 
 ## 参数
 
@@ -25,6 +25,7 @@ npx -y ai-otel-setup url=你的服务器地址
 ## 装好后会做什么
 
 - 在 `~/.claude/cc-otel/` 放一个启动脚本
+- 如果检测到 `~/.config/opencode`，会在 `~/.config/opencode/plugins/` 放一个 OpenCode 插件
 - 备份你原来的 `~/.claude/settings.json`（带时间戳，可随时还原）
 - 把上报相关配置写进 `~/.claude/settings.json`
 
@@ -44,6 +45,7 @@ npx -y ai-otel-setup url=你的服务器地址
 ```bash
 ls ~/.claude/settings.json.bak.* | tail -1 | xargs -I{} cp {} ~/.claude/settings.json
 rm -rf ~/.claude/cc-otel
+rm -rf ~/.config/opencode/ai-otel ~/.config/opencode/plugins/ai-otel-setup.mjs
 ```
 
 ## 排查
