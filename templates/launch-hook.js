@@ -14,6 +14,12 @@
 const { spawnSync, execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+let logEvent = () => {};
+try {
+  ({ logEvent } = require("./logging.js"));
+} catch (_) {
+  // Logging is best effort; old installs may not have logging.js yet.
+}
 
 const PACKAGE_NAME = "ai-otel-setup";
 const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
@@ -62,9 +68,13 @@ function runAutoUpdate(installDir) {
   const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
   const state = readJSONSafe(statePath);
   const now = Date.now();
+  logEvent("auto_update_start", {
+    currentVersion: cfg.installerVersion || cfg.version || "0.0.0",
+  });
 
   if (!cfg.endpoint) {
     writeJSONSafe(statePath, { ...state, lastFinishedAt: now, lastResult: "skipped" });
+    logEvent("auto_update_skipped", { reason: "missing_endpoint" });
     return;
   }
 
@@ -85,9 +95,11 @@ function runAutoUpdate(installDir) {
         lastFinishedAt: now,
         lastResult: "up-to-date",
       });
+      logEvent("auto_update_up_to_date", { currentVersion, latestVersion });
       return;
     }
 
+    logEvent("auto_update_install_start", { currentVersion, latestVersion });
     execFileSync(npmBin("npx"), ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`], {
       stdio: "ignore",
       timeout: 120000,
@@ -102,6 +114,7 @@ function runAutoUpdate(installDir) {
       lastFinishedAt: Date.now(),
       lastResult: "updated",
     });
+    logEvent("auto_update_updated", { previousVersion: currentVersion, latestVersion });
   } catch (e) {
     writeJSONSafe(statePath, {
       ...state,
@@ -109,6 +122,10 @@ function runAutoUpdate(installDir) {
       lastFinishedAt: Date.now(),
       lastResult: "failed",
       lastError: e && e.message ? String(e.message).slice(0, 300) : "unknown",
+    });
+    logEvent("auto_update_failed", {
+      currentVersion,
+      error: e && e.message ? e.message : "unknown",
     });
   }
 }
@@ -137,8 +154,10 @@ function maybeSpawnAutoUpdate(nodeBin, installDir) {
       windowsHide: true,
     });
     child.unref();
+    logEvent("auto_update_scheduled", { lastResult: state.lastResult || "" });
   } catch (_) {
     writeJSONSafe(statePath, { ...state, lastAttemptAt: now, lastResult: "spawn-failed" });
+    logEvent("auto_update_spawn_failed");
   }
 }
 
@@ -165,6 +184,14 @@ try {
 
 maybeSpawnAutoUpdate(nodeBin, __dirname);
 
+const startedAt = Date.now();
+logEvent("hook_launcher_start", { script: path.basename(scriptPath) });
 const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit" });
+logEvent("hook_launcher_exit", {
+  script: path.basename(scriptPath),
+  status: r.status === null ? 1 : r.status,
+  signal: r.signal || "",
+  durationMs: Date.now() - startedAt,
+});
 // status 为 null 表示进程被信号杀掉（SIGTERM 等），按 1 处理
 process.exit(r.status === null ? 1 : r.status);

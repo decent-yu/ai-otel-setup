@@ -30,6 +30,16 @@ npx -y ai-otel-setup url=你的服务器地址
 
 你原本的其他设置都会保留；重复运行不会产生重复条目，可以放心重装。
 
+## 本地日志
+
+安装后会在本机写入排查日志，只保留最近 3 天数据：
+
+| 工具 | 日志路径 |
+|---|---|
+| Claude Code | `~/.claude/cc-otel/ai-otel.log` |
+| Codex CLI | `~/.codex/ai-otel/ai-otel.log` |
+| Gemini CLI | `~/.gemini/ai-otel/ai-otel.log` |
+
 ## 采集了哪些数据
 
 |  | 内容 |

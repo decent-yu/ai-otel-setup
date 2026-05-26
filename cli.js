@@ -73,6 +73,7 @@ function installLauncher(installDir) {
   const launcherDest = path.join(installDir, "launch-hook.js");
   fs.copyFileSync(path.join(__dirname, "templates", "launch-hook.js"), launcherDest);
   fs.chmodSync(launcherDest, 0o755);
+  fs.copyFileSync(path.join(__dirname, "templates", "logging.js"), path.join(installDir, "logging.js"));
   return launcherDest;
 }
 

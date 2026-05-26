@@ -8,6 +8,12 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
+let logEvent = () => {};
+try {
+  ({ logEvent } = require("./logging.js"));
+} catch (_) {
+  // Logging is best effort; old installs may not have logging.js yet.
+}
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -48,7 +54,11 @@ function endpoint() {
     const conversation = input.conversation || {};
     const sid = conversation.id || input.conversation_id || input.session_id || "";
     const seen = path.join(os.homedir(), ".codex", "ai-otel", `.session-seen.${sid || "unknown"}`);
-    if (sid && fs.existsSync(seen)) process.exit(0);
+    logEvent("codex_hook_start", { hasSessionId: !!sid });
+    if (sid && fs.existsSync(seen)) {
+      logEvent("codex_hook_skip", { reason: "session_seen" });
+      process.exit(0);
+    }
     // 注意：seen 文件必须在 OTLP 发送成功后才写——见下方 res.on("end")。
     // 之前在此处直接写盘，会导致 collector 暂时不可用时第一次失败也被记为
     // "已上报"，从此 codex resume 同一 conversation 永远跳过 hook_session_start。
@@ -74,14 +84,26 @@ function endpoint() {
       res.on("end", () => {
         // 仅 2xx 才视为成功——4xx/5xx 留给下次启动重试，避免静默丢失
         if (res.statusCode >= 200 && res.statusCode < 300) markSeen();
+        logEvent("codex_hook_post_end", { statusCode: res.statusCode || 0 });
         process.exit(0);
       });
     });
-    req.on("error", () => process.exit(0));
-    req.on("timeout", () => { req.destroy(); process.exit(0); });
+    req.on("error", (e) => {
+      logEvent("codex_hook_post_error", { error: e && e.message ? e.message : "request_error" });
+      process.exit(0);
+    });
+    req.on("timeout", () => {
+      logEvent("codex_hook_post_timeout");
+      req.destroy();
+      process.exit(0);
+    });
     req.end(payload);
-    setTimeout(() => process.exit(0), 2500).unref();
+    setTimeout(() => {
+      logEvent("codex_hook_timeout_exit");
+      process.exit(0);
+    }, 2500).unref();
   } catch (_) {
+    logEvent("codex_hook_error");
     process.exit(0);
   }
 })();

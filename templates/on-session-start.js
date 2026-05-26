@@ -33,6 +33,12 @@ const path = require("path");
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
+let logEvent = () => {};
+try {
+  ({ logEvent } = require("./logging.js"));
+} catch (_) {
+  // Logging is best effort; old installs may not have logging.js yet.
+}
 
 // UserPromptSubmit 节流窗口：2 分钟
 const PROMPT_THROTTLE_MS = 2 * 60 * 1000;
@@ -119,6 +125,10 @@ function safeGit(args) {
     const sessionId = input.session_id || input.sessionId || ""; // MVP 实证：stdin.session_id = OTel session.id
     // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支
     const isPromptFallback = input.hook_event_name === "UserPromptSubmit";
+    logEvent("cc_hook_start", {
+      hookKind: isPromptFallback ? "user_prompt_fallback" : "session_start",
+      hasSessionId: !!sessionId,
+    });
 
     // 兜底路径节流：sid 维度 2 分钟最多一次（marker 文件 mtime 判断）。
     // 失败重试窗口同时由此控制：marker 过期后允许下次 prompt 再发一次。
@@ -128,6 +138,7 @@ function safeGit(args) {
       try {
         const mtime = fs.statSync(markerPath).mtimeMs;
         if (Date.now() - mtime < PROMPT_THROTTLE_MS) {
+          logEvent("cc_hook_skip", { reason: "prompt_throttled" });
           process.exit(0);
         }
       } catch (_) {
@@ -208,13 +219,26 @@ function safeGit(args) {
       },
       (res) => {
         res.resume();
-        res.on("end", done);
-        res.on("error", done);
+        res.on("end", () => {
+          logEvent("cc_hook_post_end", { statusCode: res.statusCode || 0 });
+          done();
+        });
+        res.on("error", (e) => {
+          logEvent("cc_hook_post_error", { error: e && e.message ? e.message : "response_error" });
+          done();
+        });
       }
     );
 
-    req.on("error", done);     // 失败静默退出
-    req.on("timeout", () => { req.destroy(); done(); });
+    req.on("error", (e) => {
+      logEvent("cc_hook_post_error", { error: e && e.message ? e.message : "request_error" });
+      done();
+    });     // 失败静默退出
+    req.on("timeout", () => {
+      logEvent("cc_hook_post_timeout");
+      req.destroy();
+      done();
+    });
 
     // 在真正发包前 touch marker 文件——把"已尝试上报"持久化下来，
     // 让后续 2 分钟内的 UserPromptSubmit 跳过重复 POST。失败也照写，
@@ -235,6 +259,7 @@ function safeGit(args) {
     setTimeout(done, 2500).unref();
   } catch (_) {
     // 兜底：任何异常都不阻塞 CC
+    logEvent("cc_hook_error");
     process.exit(0);
   }
 })();

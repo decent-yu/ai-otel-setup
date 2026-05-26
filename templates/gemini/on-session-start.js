@@ -8,6 +8,12 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
+let logEvent = () => {};
+try {
+  ({ logEvent } = require("./logging.js"));
+} catch (_) {
+  // Logging is best effort; old installs may not have logging.js yet.
+}
 
 function safeGit(args) {
   try {
@@ -37,6 +43,7 @@ function endpoint() {
 }
 
 try {
+  logEvent("gemini_hook_start", { hasSessionId: !!process.env.GEMINI_SESSION_ID });
   const cwd = process.cwd();
   const event = {
     "tool_kind": "gemini",
@@ -52,11 +59,28 @@ try {
   };
   const payload = JSON.stringify({ resourceLogs: [{ resource: { attributes: [] }, scopeLogs: [{ logRecords: [{ timeUnixNano: `${Date.now()}000000`, body: { stringValue: "hook_session_start" }, attributes: Object.entries(event).map(([key, value]) => ({ key, value: { stringValue: String(value ?? "") } })) }] }] }] });
   const url = new URL(endpoint());
-  const req = (url.protocol === "https:" ? https : http).request(url, { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }, timeout: 2000 }, (res) => { res.resume(); res.on("end", () => process.exit(0)); });
-  req.on("error", () => process.exit(0));
-  req.on("timeout", () => { req.destroy(); process.exit(0); });
+  const req = (url.protocol === "https:" ? https : http).request(url, { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }, timeout: 2000 }, (res) => {
+    res.resume();
+    res.on("end", () => {
+      logEvent("gemini_hook_post_end", { statusCode: res.statusCode || 0 });
+      process.exit(0);
+    });
+  });
+  req.on("error", (e) => {
+    logEvent("gemini_hook_post_error", { error: e && e.message ? e.message : "request_error" });
+    process.exit(0);
+  });
+  req.on("timeout", () => {
+    logEvent("gemini_hook_post_timeout");
+    req.destroy();
+    process.exit(0);
+  });
   req.end(payload);
-  setTimeout(() => process.exit(0), 2500).unref();
+  setTimeout(() => {
+    logEvent("gemini_hook_timeout_exit");
+    process.exit(0);
+  }, 2500).unref();
 } catch (_) {
+  logEvent("gemini_hook_error");
   process.exit(0);
 }
