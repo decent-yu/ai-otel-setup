@@ -221,6 +221,14 @@ function metricsEndpointFromLogs(logsEndpoint) {
   return url.toString();
 }
 
+function tracesEndpointFromLogs(logsEndpoint) {
+  const url = new URL(logsEndpoint);
+  url.pathname = "/v1/traces";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
 function extractHost(endpoint) {
   // 从已 resolve 的 endpoint 取 host（不带端口），用于 NO_PROXY
   try {
@@ -693,15 +701,45 @@ function ensureFeaturesHooksTrue(text) {
   return text.trimEnd() + "\n\n[features]\nhooks = true\n";
 }
 
-function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
+function buildCodexOtelBlock(endpoint, otelTransport) {
   // exporter / trace_exporter / metrics_exporter 是 externally-tagged enum：
   //   - 写 scalar `exporter = "otlp-grpc"`：codex 解析为 unit variant，因为
   //     OtlpGrpc 是 struct variant（带 endpoint 等字段），报
   //     "invalid type: unit variant, expected struct variant"。
   //   - 同时写 scalar 和 table：报 "cannot extend value of type string"。
-  //   - 只写 table `[otel.exporter."otlp-grpc"]`：✓ codex 把它解析为
+  //   - 只写 table `[otel.exporter."otlp-grpc"]` / `[otel.exporter."otlp-http"]`：✓ codex 把它解析为
   //     OtlpGrpc { endpoint }，tag 来自 key 名。
   // 官方 sample 之所以能 `exporter = "none"`，是因为 None 本身就是 unit variant。
+  if (otelTransport !== "http") {
+    return [
+      '[otel.exporter."otlp-grpc"]',
+      `endpoint = ${JSON.stringify(endpoint)}`,
+      "",
+      '[otel.trace_exporter."otlp-grpc"]',
+      `endpoint = ${JSON.stringify(endpoint)}`,
+      "",
+      '[otel.metrics_exporter."otlp-grpc"]',
+      `endpoint = ${JSON.stringify(endpoint)}`,
+    ];
+  }
+
+  const logsEndpoint = logsEndpointFromGrpc(endpoint);
+  return [
+    '[otel.exporter."otlp-http"]',
+    `endpoint = ${JSON.stringify(logsEndpoint)}`,
+    'protocol = "binary"',
+    "",
+    '[otel.trace_exporter."otlp-http"]',
+    `endpoint = ${JSON.stringify(tracesEndpointFromLogs(logsEndpoint))}`,
+    'protocol = "binary"',
+    "",
+    '[otel.metrics_exporter."otlp-http"]',
+    `endpoint = ${JSON.stringify(metricsEndpointFromLogs(logsEndpoint))}`,
+    'protocol = "binary"',
+  ];
+}
+
+function buildCodexManagedBlock(endpoint, hookDest, launcherDest, otelTransport) {
   // [features].hooks = true 由 ensureFeaturesHooksTrue 写到用户块里，避免重复声明 [features]
   return [
     CODEX_MANAGED_BEGIN,
@@ -709,14 +747,7 @@ function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
     'environment = "prod"',
     "log_user_prompt = false",
     "",
-    '[otel.exporter."otlp-grpc"]',
-    `endpoint = ${JSON.stringify(endpoint)}`,
-    "",
-    '[otel.trace_exporter."otlp-grpc"]',
-    `endpoint = ${JSON.stringify(endpoint)}`,
-    "",
-    '[otel.metrics_exporter."otlp-grpc"]',
-    `endpoint = ${JSON.stringify(endpoint)}`,
+    ...buildCodexOtelBlock(endpoint, otelTransport),
     "",
     "[[hooks.SessionStart]]",
     'matcher = "startup|resume"',
@@ -755,7 +786,7 @@ function installCodex(home, endpoint, otelTransport) {
   // hook 同目录的 endpoint.json：hook 脚本运行时读它拿 logs endpoint，避免依赖
   // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
   writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
-  const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest);
+  const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest, otelTransport);
   const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
   return { tool: "codex", status: "installed", path: configPath, backup: bak };
