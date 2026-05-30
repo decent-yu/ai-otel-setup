@@ -2,35 +2,35 @@
 
 一键开通团队的 Claude Code / Codex CLI / Gemini CLI 使用数据上报。
 
-本工具只负责在用户本机写入 AI CLI 的 OpenTelemetry 上报配置；Collector、Forward 服务和数据看板由团队另行部署，不包含在本仓库内。
+`ai-otel-setup` 是一个本机安装器，用于写入 AI CLI 的 OpenTelemetry 上报配置和 hooks。Collector、Forward 服务和数据看板由团队另行部署，不包含在本仓库内。
 
 ```text
 Claude Code / Codex CLI / Gemini CLI
   -> ai-otel-setup 写入的 OTel 配置和 hooks
   -> 团队提供的上报端点
+  -> Collector / Forward（团队另行部署）
+  -> 数据看板（团队另行部署）
 ```
 
 ## 配套看板示例
 
-采集到的数据可以接入团队另行部署的数据看板，用于查看 Token 用量、API 费用、代码变动、活跃会话和工作区投入等指标。下图为脱敏后的示例效果，数据看板服务不包含在本仓库内。
+采集到的数据可接入团队的数据看板，用于查看 Token 用量、API 费用、代码变动、活跃会话和工作区投入等指标。
+
+下图为脱敏后的示例效果：
 
 ![AI 助手观测平台看板示例](docs/assets/dashboard-demo.png)
 
 ## 安装
 
 ```bash
-npx -y ai-otel-setup url=你的服务器地址
+npx -y ai-otel-setup url=collector服务地址
 ```
 
-> 国内网络慢可以临时切到淘宝镜像：`npm config set registry https://registry.npmmirror.com`，再执行上面的命令。
->
-> 兼容旧命令：`npx -y cc-otel-installer url=...` 仍然可用，行为完全一致。
+> 国内网络慢可以临时切到淘宝镜像：`npm config set registry https://registry.npmmirror.com`，再执行安装命令。
 
-把 `你的服务器地址` 替换成团队提供的实际地址（例如 `url=10.20.30.40`）。具体地址请向团队负责人索取。
+把 `collector服务地址` 替换成团队提供的实际地址，例如：url=collector.example.com。具体地址请向团队负责人索取。
 
-装好后直接运行 `claude` / `codex` / `gemini`，上报会自动开始，无需任何额外配置。
-
-## 参数
+装好后直接运行 `claude` / `codex` / `gemini`，上报会自动开始，无需额外配置。
 
 | 参数 | 说明 |
 |---|---|
@@ -38,13 +38,20 @@ npx -y ai-otel-setup url=你的服务器地址
 | `--http` / `http=1` | Claude Code 原生 OTel 使用 OTLP/HTTP。默认使用此模式，logs 指向 `/v1/logs`，metrics 指向 `/v1/metrics`。 |
 | `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC，作为 HTTP 上报异常时的 fallback。 |
 
-## 装好后会做什么
+## 安装后会做什么
 
 - 在 `~/.claude/cc-otel/` 放一个启动脚本
 - 备份你原来的 `~/.claude/settings.json`（带时间戳，可随时还原）
 - 把上报相关配置写进 `~/.claude/settings.json`
 
 你原本的其他设置都会保留；重复运行不会产生重复条目，可以放心重装。
+
+## 采集了哪些数据
+
+| 类型 | 内容 |
+|---|---|
+| 会采集 | 调用了哪些工具、每次耗时、是否成功、Token 用量、当前目录、Git 信息 |
+| 不采集 | 你输入的提示词、代码正文、工具入参、API 原始内容 |
 
 ## 本地日志
 
@@ -55,13 +62,6 @@ npx -y ai-otel-setup url=你的服务器地址
 | Claude Code | `~/.claude/cc-otel/ai-otel.log` |
 | Codex CLI | `~/.codex/ai-otel/ai-otel.log` |
 | Gemini CLI | `~/.gemini/ai-otel/ai-otel.log` |
-
-## 采集了哪些数据
-
-|  | 内容 |
-|---|---|
-| ✅ 会采集 | 调用了哪些工具、每次耗时、是否成功、token 用量、当前目录、Git 信息 |
-| ❌ 不采集 | 你输入的提示词、代码正文、工具入参、API 原始内容 |
 
 ## 卸载
 
