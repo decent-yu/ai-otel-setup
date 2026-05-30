@@ -520,6 +520,28 @@ function removeSessionSeenMarkers(installDir) {
 
 // ---------- 合并逻辑 ----------
 
+// 健壮的 hook dedup：id 优先 + command 指纹兜底
+// 修复 https://github.com/decent-yu/ai-otel-setup/issues/duplicate-hook
+// 当外部工具（如 Claude Code /hooks UI）抹掉 id 字段时，按 command 内容识别
+function findExistingHookIdx(arr, hookId, commandSignature) {
+  // 1. 先按 id 精确匹配（保留原行为）
+  let idx = arr.findIndex((h) => h && h.id === hookId);
+  if (idx >= 0) return idx;
+
+  // 2. id 缺失时按 command 指纹兜底
+  //    判断条件：command 字符串里含我们的特征路径片段
+  //    避免误伤用户自己写的、命令完全不同的 hook
+  idx = arr.findIndex(
+    (h) =>
+      h &&
+      Array.isArray(h.hooks) &&
+      h.hooks.some(
+        (c) => c && typeof c.command === "string" && c.command.includes(commandSignature)
+      )
+  );
+  return idx;
+}
+
 function buildEnv(template, args, endpoint, otelTransport) {
   const env = { ...template.env };
   if (otelTransport === "http") {
@@ -565,20 +587,22 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
   merged.hooks = { ...(existing.hooks || {}) };
 
   // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
+  // 使用健壮 dedup：id 优先 + command 指纹兜底（修复外部工具抹掉 id 的场景）
   const sessionStart = Array.isArray(merged.hooks.SessionStart)
     ? [...merged.hooks.SessionStart]
     : [];
-  const idx = sessionStart.findIndex((h) => h && h.id === HOOK_ID);
+  const idx = findExistingHookIdx(sessionStart, HOOK_ID, "/cc-otel/launch-hook.js");
   if (idx >= 0) sessionStart[idx] = hookEntry;
   else sessionStart.push(hookEntry);
   merged.hooks.SessionStart = sessionStart;
 
   // hooks.UserPromptSubmit：兜底 hook，按 PROMPT_HOOK_ID 去重，规则同上
+  // 使用健壮 dedup：id 优先 + command 指纹兜底
   if (promptHookEntry) {
     const userPromptSubmit = Array.isArray(merged.hooks.UserPromptSubmit)
       ? [...merged.hooks.UserPromptSubmit]
       : [];
-    const pidx = userPromptSubmit.findIndex((h) => h && h.id === PROMPT_HOOK_ID);
+    const pidx = findExistingHookIdx(userPromptSubmit, PROMPT_HOOK_ID, "/cc-otel/launch-hook.js");
     if (pidx >= 0) userPromptSubmit[pidx] = promptHookEntry;
     else userPromptSubmit.push(promptHookEntry);
     merged.hooks.UserPromptSubmit = userPromptSubmit;
@@ -830,7 +854,8 @@ function installGemini(home, endpoint, otelTransport) {
     id: HOOK_ID,
     command: buildHookCommand(launcherDest, hookDest),
   };
-  const idx = sessionStart.findIndex((h) => h && h.id === HOOK_ID);
+  // 使用健壮 dedup：id 优先 + command 指纹兜底
+  const idx = findExistingHookIdx(sessionStart, HOOK_ID, "/ai-otel/launch-hook.js");
   if (idx >= 0) sessionStart[idx] = hookEntry;
   else sessionStart.push(hookEntry);
   merged.hooks.SessionStart = sessionStart;
