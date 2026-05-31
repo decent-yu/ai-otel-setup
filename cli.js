@@ -14,7 +14,7 @@
  *
  * 关键约束：
  *   - 失败时尽量给出可操作信息，不静默
- *   - settings.json 写之前会备份到 settings.json.bak（每次覆盖，仅保留上一份）
+ *   - settings.json 写之前会备份到 settings.json.bak；若该备份已存在，则备份到带时间戳的 settings.json.bak.<时间戳>，保留历史备份
  *   - 多次运行幂等（按 hook id=team:session-start 去重）
  *   - 不依赖任何运行时第三方包，只用 Node 标准库
  */
@@ -492,9 +492,25 @@ function writeJSONAtomic(p, obj) {
   fs.renameSync(tmp, p);
 }
 
+// 文件系统安全的时间戳：YYYYMMDD-HHMMSS（本地时间）
+function backupTimestamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  );
+}
+
 function backup(p) {
   if (!fs.existsSync(p)) return null;
-  const bak = `${p}.bak`;
+  // 首次备份用固定名 .bak；若 .bak 已存在，改用带时间戳的名字，避免覆盖上一份备份
+  let bak = `${p}.bak`;
+  if (fs.existsSync(bak)) {
+    bak = `${p}.bak.${backupTimestamp()}`;
+    // 极端情况下同一秒内重复运行，再加 pid 兜底唯一性
+    if (fs.existsSync(bak)) bak = `${bak}.${process.pid}`;
+  }
   fs.copyFileSync(p, bak);
   return bak;
 }

@@ -35,7 +35,7 @@ npx -y ai-otel-setup url=你的服务器地址
 
 ## 装好后会做什么
 
-按检测到的 CLI 分别写入配置（备份均为同名 `.bak`，每次覆盖只保留上一份）：
+按检测到的 CLI 分别写入配置（首次备份为同名 `.bak`；若 `.bak` 已存在，则保留它并把本次备份写到带时间戳的 `.bak.<时间戳>`）：
 
 | 工具 | 改动 |
 |---|---|
@@ -84,7 +84,7 @@ cp ~/.gemini/settings.json.bak ~/.gemini/settings.json   # 若有备份
 rm -rf ~/.gemini/ai-otel
 ```
 
-> 备份是固定的 `.bak` 文件（非时间戳），每次安装会覆盖。若没有 `.bak`（首次安装前没有配置文件），手动从对应配置里删掉 OTel 相关 env、`telemetry`/`[otel]` 段，以及 `id` 为 `team:session-start` / `team:user-prompt-submit` 的 hook 条目即可。
+> 同名 `.bak` 是**首次安装前**的原始配置（后续重装不会覆盖它——会另存为 `.bak.<时间戳>`），所以上面的 `cp` 命令能还原到最初状态。若没有 `.bak`（首次安装前没有配置文件），手动从对应配置里删掉 OTel 相关 env、`telemetry`/`[otel]` 段，以及 `id` 为 `team:session-start` / `team:user-prompt-submit` 的 hook 条目即可。
 
 ## 排查
 
