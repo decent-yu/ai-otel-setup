@@ -9,9 +9,9 @@
     "OTEL_METRIC_EXPORT_INTERVAL": "60000",
     "OTEL_METRICS_INCLUDE_VERSION": "true",
     "OTEL_LOG_USER_PROMPTS": "0",
-    "OTEL_LOG_TOOL_DETAILS": "1",
+    "OTEL_LOG_TOOL_DETAILS": "0",
     "OTEL_LOG_TOOL_CONTENT": "0",
     "OTEL_LOG_RAW_API_BODIES": "0"
   },
-  "_comment": "Installer 会替换 OTEL_EXPORTER_OTLP_ENDPOINT (PLACEHOLDER_ENDPOINT)。TOOL_DETAILS=1 是为了采到 skill/plugin 真名，Collector 侧会硬删敏感 JSON blob，详见 v1.2 §3.3。"
+  "_comment": "Installer 会替换 OTEL_EXPORTER_OTLP_ENDPOINT (PLACEHOLDER_ENDPOINT)。TOOL_DETAILS=0：客户端不上报工具入参，仅采工具名/耗时/结果等元数据。"
 }

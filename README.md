@@ -40,11 +40,17 @@ npx -y ai-otel-setup url=collector服务地址
 
 ## 安装后会做什么
 
-- 在 `~/.claude/cc-otel/` 放一个启动脚本
-- 备份你原来的 `~/.claude/settings.json`（带时间戳，可随时还原）
-- 把上报相关配置写进 `~/.claude/settings.json`
+按检测到的 CLI 分别写入配置（备份均为同名 `.bak`，每次覆盖只保留上一份）：
 
-你原本的其他设置都会保留；重复运行不会产生重复条目，可以放心重装。
+| 工具 | 改动 |
+|---|---|
+| Claude Code | 在 `~/.claude/cc-otel/` 放启动脚本；备份 `~/.claude/settings.json` 到 `settings.json.bak`，写入 OTel env、`SessionStart` 与 `UserPromptSubmit` 两个 hook（后者是兜底，救 SessionStart 漏发的场景），并把 collector 地址追加进 `NO_PROXY` 以绕过本地代理 |
+| Codex CLI | 在 `~/.codex/ai-otel/` 放启动脚本；备份 `~/.codex/config.toml` 到 `config.toml.bak`，在 `# >>> ai-otel-setup managed >>>` 标记块内写入 `[otel]` 与 SessionStart hook |
+| Gemini CLI | 在 `~/.gemini/ai-otel/` 放启动脚本；备份 `~/.gemini/settings.json` 到 `settings.json.bak`，写入 `telemetry` 与 SessionStart hook |
+
+安装时还会发一条注册记录（git 邮箱 / 姓名、机器名、OS、Node 版本）到 collector，用于识别装机情况。
+
+你原本的其他设置都会保留；重复运行不会产生重复条目（按 hook id 与 managed 标记块去重），可以放心重装。安装的版本不会自动升级，需要更新时重跑安装命令即可。
 
 ## 采集了哪些数据
 
@@ -65,12 +71,23 @@ npx -y ai-otel-setup url=collector服务地址
 
 ## 卸载
 
-还原安装前的备份即可：
+还原安装前的备份，并删掉 hook 目录即可。按你装过的 CLI 分别执行：
 
 ```bash
-ls ~/.claude/settings.json.bak.* | tail -1 | xargs -I{} cp {} ~/.claude/settings.json
+# Claude Code
+cp ~/.claude/settings.json.bak ~/.claude/settings.json   # 若有备份
 rm -rf ~/.claude/cc-otel
+
+# Codex CLI
+cp ~/.codex/config.toml.bak ~/.codex/config.toml         # 若有备份
+rm -rf ~/.codex/ai-otel
+
+# Gemini CLI
+cp ~/.gemini/settings.json.bak ~/.gemini/settings.json   # 若有备份
+rm -rf ~/.gemini/ai-otel
 ```
+
+> 备份是固定的 `.bak` 文件（非时间戳），每次安装会覆盖。若没有 `.bak`（首次安装前没有配置文件），手动从对应配置里删掉 OTel 相关 env、`telemetry`/`[otel]` 段，以及 `id` 为 `team:session-start` / `team:user-prompt-submit` 的 hook 条目即可。
 
 ## 排查
 

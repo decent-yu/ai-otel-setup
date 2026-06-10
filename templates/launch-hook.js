@@ -11,7 +11,7 @@
 // stdio: "inherit"：stdin（Codex/CC 传 hook payload JSON）、stderr 都直通给 hook
 // 子进程，hook 那边的 readStdin / process.stderr 行为不受影响。退出码原样转发。
 
-const { spawnSync, execFileSync, spawn } = require("child_process");
+const { spawnSync, execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 let logEvent = () => {};
@@ -21,155 +21,11 @@ try {
   // Logging is best effort; old installs may not have logging.js yet.
 }
 
-const PACKAGE_NAME = "ai-otel-setup";
-const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
-const UPDATE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
-
 function readJSONSafe(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (_) {
     return {};
-  }
-}
-
-function writeJSONSafe(file, obj) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-function parseVersion(v) {
-  const m = String(v || "").trim().match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!m) return null;
-  return [Number(m[1]), Number(m[2]), Number(m[3])];
-}
-
-function compareVersions(a, b) {
-  const av = parseVersion(a);
-  const bv = parseVersion(b);
-  if (!av || !bv) return 0;
-  for (let i = 0; i < 3; i++) {
-    if (av[i] > bv[i]) return 1;
-    if (av[i] < bv[i]) return -1;
-  }
-  return 0;
-}
-
-function npmBin(name) {
-  return process.platform === "win32" ? `${name}.cmd` : name;
-}
-
-function runNpmToolSync(name, args, options) {
-  const command = npmBin(name);
-  return execFileSync(command, args, {
-    ...options,
-    // Windows cannot reliably exec .cmd shims directly via execFileSync.
-    shell: process.platform === "win32",
-  });
-}
-
-function runAutoUpdate(installDir) {
-  const statePath = path.join(installDir, "auto-update-state.json");
-  const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
-  const state = readJSONSafe(statePath);
-  const now = Date.now();
-  logEvent("auto_update_start", {
-    currentVersion: cfg.installerVersion || cfg.version || "0.0.0",
-  });
-
-  if (!cfg.endpoint) {
-    writeJSONSafe(statePath, { ...state, lastFinishedAt: now, lastResult: "skipped" });
-    logEvent("auto_update_skipped", { reason: "missing_endpoint" });
-    return;
-  }
-
-  const currentVersion = cfg.installerVersion || cfg.version || "0.0.0";
-  try {
-    const latestVersion = runNpmToolSync("npm", ["view", PACKAGE_NAME, "version"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 8000,
-      windowsHide: true,
-    }).trim();
-
-    if (!latestVersion || compareVersions(latestVersion, currentVersion) <= 0) {
-      writeJSONSafe(statePath, {
-        ...state,
-        currentVersion,
-        latestVersion,
-        lastFinishedAt: now,
-        lastResult: "up-to-date",
-      });
-      logEvent("auto_update_up_to_date", { currentVersion, latestVersion });
-      return;
-    }
-
-    logEvent("auto_update_install_start", { currentVersion, latestVersion });
-    const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
-    if (cfg.otelTransport === "http") installArgs.push("--http");
-    if (cfg.otelTransport === "grpc" && process.platform === "win32") installArgs.push("--grpc");
-    runNpmToolSync("npx", installArgs, {
-      stdio: "ignore",
-      timeout: 120000,
-      windowsHide: true,
-      env: { ...process.env, AI_OTEL_AUTO_UPDATE: "1" },
-    });
-
-    writeJSONSafe(statePath, {
-      ...state,
-      previousVersion: currentVersion,
-      latestVersion,
-      lastFinishedAt: Date.now(),
-      lastResult: "updated",
-    });
-    logEvent("auto_update_updated", { previousVersion: currentVersion, latestVersion });
-  } catch (e) {
-    writeJSONSafe(statePath, {
-      ...state,
-      currentVersion,
-      lastFinishedAt: Date.now(),
-      lastResult: "failed",
-      lastError: e && e.message ? String(e.message).slice(0, 300) : "unknown",
-    });
-    logEvent("auto_update_failed", {
-      currentVersion,
-      error: e && e.message ? e.message : "unknown",
-    });
-  }
-}
-
-function maybeSpawnAutoUpdate(nodeBin, installDir) {
-  const cfgPath = path.join(installDir, "endpoint.json");
-  if (!fs.existsSync(cfgPath)) return;
-
-  const statePath = path.join(installDir, "auto-update-state.json");
-  const state = readJSONSafe(statePath);
-  const now = Date.now();
-  const lastAttemptAt = Number(state.lastAttemptAt || 0);
-  const shouldRetrySoon =
-    state.lastResult === "failed" ||
-    state.lastResult === "scheduled" ||
-    state.lastResult === "spawn-failed";
-  const interval = shouldRetrySoon ? UPDATE_RETRY_INTERVAL_MS : UPDATE_CHECK_INTERVAL_MS;
-  if (lastAttemptAt && now - lastAttemptAt < interval) return;
-
-  if (!writeJSONSafe(statePath, { ...state, lastAttemptAt: now, lastResult: "scheduled" })) return;
-
-  try {
-    const child = spawn(nodeBin, [__filename, "--auto-update", installDir], {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    child.unref();
-    logEvent("auto_update_scheduled", { lastResult: state.lastResult || "" });
-  } catch (_) {
-    writeJSONSafe(statePath, { ...state, lastAttemptAt: now, lastResult: "spawn-failed" });
-    logEvent("auto_update_spawn_failed");
   }
 }
 
@@ -209,11 +65,6 @@ function settingsTelemetrySnapshot(installDir) {
   };
 }
 
-if (process.argv[2] === "--auto-update") {
-  runAutoUpdate(process.argv[3] || __dirname);
-  process.exit(0);
-}
-
 const scriptPath = process.argv[2];
 if (!scriptPath) process.exit(0);
 
@@ -229,8 +80,6 @@ try {
   // 启动不起来，根本走不到这里——也就是说 hook 真挂的时候用户会感知到，符合
   // 不静默吞错的预期。
 }
-
-maybeSpawnAutoUpdate(nodeBin, __dirname);
 
 const startedAt = Date.now();
 logEvent("hook_launcher_start", {
