@@ -73,6 +73,31 @@ npx -y ai-otel-setup url=collector服务地址 --no-local-usage
 
 或重装时去掉这个参数即可恢复默认开启。
 
+### 手动触发补报
+
+如果想立刻补一次（比如换了新机器、看板缺数据），可以不走 hook 直接触发：
+
+```bash
+# 默认行为：扫近 7 天，受节流和历史 lock 限制
+npx -y ai-otel-setup usage-backfill
+
+# 强制全量重扫 + 自定义窗口
+npx -y ai-otel-setup usage-backfill --window=30 --force
+
+# 只算不发，看看会发出去什么
+npx -y ai-otel-setup usage-backfill --window=30 --dry-run
+```
+
+| 子参数 | 说明 |
+|---|---|
+| `--window=N` | 扫描近 N 天（默认 7，上限 30）。 |
+| `--dry-run` | 算出 buckets 后只 print 统计，不发包，也不更新本地 lock。 |
+| `--force` | 等同于 `--ignore-throttle --ignore-lock`，绕过 5 分钟节流和历史天锁。 |
+| `--ignore-throttle` | 跳过 5 分钟同机节流。 |
+| `--ignore-lock` | 跳过历史天 lock，重扫所有 day。 |
+
+> 必须先正常装机一次（`npx -y ai-otel-setup url=...`），才有 scanner 可调用。
+
 ## 本地日志
 
 安装后会在本机写入排查日志，只保留最近 3 天数据：

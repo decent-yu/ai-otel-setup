@@ -23,18 +23,61 @@ const https = require("https");
 const readline = require("readline");
 const { URL } = require("url");
 
-let logEvent = () => {};
+let logFileEvent = () => {};
 try {
-  ({ logEvent } = require("./logging.js"));
+  ({ logEvent: logFileEvent } = require("./logging.js"));
 } catch (_) {
   // Logging best effort
 }
 
-const WINDOW_DAYS = 7;
+// ===== argv 解析 =====
+// 默认（hook 调用，无 args）：silent log → ai-otel.log
+// --manual：stdout 同步输出每个事件，给 `npx -y ai-otel-setup usage-backfill` 用
+// --ignore-throttle：跳过 5min/machine_id 节流
+// --ignore-lock：跳过历史 6 天 lock，强制重扫
+// --force：等于 --ignore-throttle --ignore-lock
+// --window=N：覆盖默认 7 天窗口，N 上限 30
+// --dry-run：算出 buckets 后不 POST，只 print 统计
+function parseArgv(argv) {
+  const opts = {
+    manual: false,
+    ignoreThrottle: false,
+    ignoreLock: false,
+    window: 7,
+    dryRun: false,
+  };
+  for (const a of argv) {
+    if (a === "--manual") opts.manual = true;
+    else if (a === "--ignore-throttle") opts.ignoreThrottle = true;
+    else if (a === "--ignore-lock") opts.ignoreLock = true;
+    else if (a === "--force") {
+      opts.ignoreThrottle = true;
+      opts.ignoreLock = true;
+    } else if (a === "--dry-run") opts.dryRun = true;
+    else if (/^--window=\d+$/.test(a)) {
+      const n = Number(a.slice("--window=".length));
+      if (Number.isFinite(n) && n > 0) opts.window = Math.min(n, 30);
+    }
+  }
+  return opts;
+}
+const OPTS = parseArgv(process.argv.slice(2));
+
+// manual 模式：每个 logEvent 同步打 stdout，给用户看进度
+function logEvent(event, fields) {
+  logFileEvent(event, fields);
+  if (OPTS.manual) {
+    const ts = new Date().toISOString().slice(11, 19);
+    const parts = Object.entries(fields || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+    process.stdout.write(`[${ts}] ${event}${parts ? " " + parts : ""}\n`);
+  }
+}
+
+const WINDOW_DAYS = OPTS.window;
 const THROTTLE_MS = 5 * 60 * 1000;
 const POST_TIMEOUT_MS = 8000;
-const MAX_RUNTIME_MS = 20 * 1000; // 单次扫总耗时上限；watchdog 兜底 60s
-const WATCHDOG_MS = 60 * 1000;
+const MAX_RUNTIME_MS = OPTS.manual ? 5 * 60 * 1000 : 20 * 1000; // manual 给 5min
+const WATCHDOG_MS = OPTS.manual ? 10 * 60 * 1000 : 60 * 1000;   // manual 给 10min
 const MAX_ROLLS_PER_POST = 500; // 与服务端 maxRolls 对齐，超过本地切批
 
 // 降优先级：扫 jsonl 不与 CC 主进程争 IO/CPU。POSIX setPriority 在 Windows 上会 throw
@@ -358,7 +401,7 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
       return;
     }
     const nowMs = Date.now();
-    if (!throttleCheck(machineId, nowMs)) {
+    if (!OPTS.ignoreThrottle && !throttleCheck(machineId, nowMs)) {
       logEvent("local_usage_skip", { reason: "throttled" });
       return;
     }
@@ -372,8 +415,10 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
     state.machine_id = machineId;
     state.locked_days = state.locked_days || {};
 
-    // 历史天若锁住则跳过；今天必扫
-    const targetDays = window.filter((d) => d === today || !state.locked_days[d]);
+    // 历史天若锁住则跳过；今天必扫。--ignore-lock 强制全部 day 都扫
+    const targetDays = OPTS.ignoreLock
+      ? window.slice()
+      : window.filter((d) => d === today || !state.locked_days[d]);
     logEvent("local_usage_start", {
       window: window.join(","),
       targetDays: targetDays.join(","),
@@ -413,12 +458,17 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
     const ccRolls = bucketsToRolls(ccBuckets);
     let ccOk = true; // 默认 ok（无 rolls 视为不需要发）
     if (ccRolls.length > 0) {
-      const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "cc", ccRolls, token, POST_TIMEOUT_MS);
-      ccOk = res.ok;
-      if (ccOk) {
-        logEvent("local_usage_post_ok", { source: "cc", batches: res.batches, rolls: res.totalRolls });
+      if (OPTS.dryRun) {
+        logEvent("local_usage_dry_run", { source: "cc", rolls: ccRolls.length });
+        ccOk = true;
       } else {
-        logEvent("local_usage_post_fail", { source: "cc", status: res.status, error: res.error });
+        const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "cc", ccRolls, token, POST_TIMEOUT_MS);
+        ccOk = res.ok;
+        if (ccOk) {
+          logEvent("local_usage_post_ok", { source: "cc", batches: res.batches, rolls: res.totalRolls });
+        } else {
+          logEvent("local_usage_post_fail", { source: "cc", status: res.status, error: res.error });
+        }
       }
     } else {
       logEvent("local_usage_done", { source: "cc", reason: "no_rolls" });
@@ -432,30 +482,52 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
     const codexRolls = bucketsToRolls(codexBuckets);
     let codexOk = true;
     if (codexRolls.length > 0) {
-      const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "codex", codexRolls, token, POST_TIMEOUT_MS);
-      codexOk = res.ok;
-      if (codexOk) {
-        logEvent("local_usage_post_ok", { source: "codex", batches: res.batches, rolls: res.totalRolls });
+      if (OPTS.dryRun) {
+        logEvent("local_usage_dry_run", { source: "codex", rolls: codexRolls.length });
+        codexOk = true;
       } else {
-        logEvent("local_usage_post_fail", { source: "codex", status: res.status, error: res.error });
+        const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "codex", codexRolls, token, POST_TIMEOUT_MS);
+        codexOk = res.ok;
+        if (codexOk) {
+          logEvent("local_usage_post_ok", { source: "codex", batches: res.batches, rolls: res.totalRolls });
+        } else {
+          logEvent("local_usage_post_fail", { source: "codex", status: res.status, error: res.error });
+        }
       }
     } else {
       logEvent("local_usage_done", { source: "codex", reason: "no_rolls" });
     }
 
-    // 两源都 ok（或都没数据）才锁历史天
-    state.last_run_at = new Date(nowMs).toISOString();
-    state.last_rolls_count = ccRolls.length + codexRolls.length;
-    if (ccOk && codexOk) {
-      for (const d of targetDays) {
-        if (d !== today) state.locked_days[d] = new Date(nowMs).toISOString();
+    // 两源都 ok（或都没数据）才锁历史天。dry-run 不写 state 文件，避免污染日常 lock。
+    if (!OPTS.dryRun) {
+      state.last_run_at = new Date(nowMs).toISOString();
+      state.last_rolls_count = ccRolls.length + codexRolls.length;
+      if (ccOk && codexOk) {
+        for (const d of targetDays) {
+          if (d !== today) state.locked_days[d] = new Date(nowMs).toISOString();
+        }
+        state.last_status = "ok";
+      } else {
+        state.last_status = `partial:cc=${ccOk ? "ok" : "fail"},codex=${codexOk ? "ok" : "fail"}`;
       }
-      state.last_status = "ok";
-    } else {
-      state.last_status = `partial:cc=${ccOk ? "ok" : "fail"},codex=${codexOk ? "ok" : "fail"}`;
+      writeStateFile(installDir, state);
     }
-    writeStateFile(installDir, state);
+
+    if (OPTS.manual) {
+      const durationMs = Date.now() - startedAt;
+      logEvent("local_usage_summary", {
+        mode: OPTS.dryRun ? "dry-run" : "post",
+        cc_rolls: ccRolls.length,
+        codex_rolls: codexRolls.length,
+        cc_status: ccOk ? "ok" : "fail",
+        codex_status: codexOk ? "ok" : "fail",
+        duration_ms: durationMs,
+        window_days: WINDOW_DAYS,
+        target_days: targetDays.length,
+      });
+    }
   } catch (e) {
     logEvent("local_usage_error", { error: (e && e.message) || "unknown" });
+    if (OPTS.manual) process.exit(1);
   }
 })();

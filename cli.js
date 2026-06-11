@@ -1199,9 +1199,62 @@ function installGemini(home, endpoint, otelTransport) {
   return { tool: "gemini", status: "installed", path: settingsPath, backup: bak };
 }
 
+// ---------- 子命令分发 ----------
+
+// `npx -y ai-otel-setup usage-backfill [...]`：调用已安装的本地用量 scanner
+// （manual mode），透传给用户加的 --window=N / --dry-run / --force 等开关。
+// 用户必须先正常装机（生成 endpoint.json 和 scanner 文件）才能用这个命令。
+function runUsageBackfillCommand(extraArgs) {
+  const installDir = path.join(os.homedir(), ".claude", "cc-otel");
+  const scannerPath = path.join(installDir, "local-usage-scanner.js");
+  const endpointPath = path.join(installDir, "endpoint.json");
+
+  if (!fs.existsSync(scannerPath) || !fs.existsSync(endpointPath)) {
+    console.error("[ai-otel-setup] 未检测到 " + installDir + "/，请先正常装机一次：");
+    console.error("  npx -y ai-otel-setup url=团队上报地址");
+    process.exit(1);
+  }
+
+  const scannerArgs = ["--manual"];
+  for (const a of extraArgs) {
+    if (a === "--help" || a === "-h") {
+      console.log("Usage: npx -y ai-otel-setup usage-backfill [选项]");
+      console.log("");
+      console.log("从本地 jsonl 重新聚合最近的 token 用量并 POST 到团队上报。");
+      console.log("默认走 7 天窗口、5 分钟节流、历史天 lock；用下面的开关可放宽。");
+      console.log("");
+      console.log("  --window=N         扫描近 N 天（默认 7，上限 30）");
+      console.log("  --dry-run          算 buckets 不发送，只 print 统计");
+      console.log("  --force            等于 --ignore-throttle --ignore-lock");
+      console.log("  --ignore-throttle  跳过 5 分钟节流");
+      console.log("  --ignore-lock      跳过历史天 lock，强制重扫");
+      return;
+    }
+    if (a === "--dry-run" || a === "--ignore-throttle" || a === "--ignore-lock" || a === "--force") {
+      scannerArgs.push(a);
+    } else if (/^--window=\d+$/.test(a)) {
+      scannerArgs.push(a);
+    } else {
+      console.error("[ai-otel-setup] usage-backfill: 未识别参数 " + JSON.stringify(a));
+      console.error("  执行 `npx -y ai-otel-setup usage-backfill --help` 查看可用开关。");
+      process.exit(2);
+    }
+  }
+
+  const result = spawnSync(process.execPath, [scannerPath, ...scannerArgs], {
+    stdio: "inherit",
+  });
+  process.exit(result.status === null ? 1 : result.status);
+}
+
 // ---------- 主流程 ----------
 
 async function main() {
+  // 子命令：positional `usage-backfill` 走独立分发，不进装机流程
+  if (process.argv[2] === "usage-backfill") {
+    return runUsageBackfillCommand(process.argv.slice(3));
+  }
+
   const args = parseArgs(process.argv.slice(2));
 
   if (args.help || args.h || process.argv.includes("--help")) {
