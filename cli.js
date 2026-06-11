@@ -634,7 +634,10 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEnt
   if (machineId) {
     const attrs = parseResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES || "");
     attrs["ai_otel.machine_id"] = machineId;
+    // 显式 set 或 delete，让"重装时不传 mongo-gray = 彻底卸下 beta"成立。
+    // 之前只 set 不 delete，导致老 OTEL_RESOURCE_ATTRIBUTES 里的 mongo_gray=beta 残留。
     if (mongoGrayTag) attrs["ai_otel.mongo_gray"] = mongoGrayTag;
+    else delete attrs["ai_otel.mongo_gray"];
     merged.env.OTEL_RESOURCE_ATTRIBUTES = serializeResourceAttrs(attrs);
   }
 

@@ -113,6 +113,9 @@ function runAutoUpdate(installDir) {
     const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
     if (cfg.otelTransport === "http") installArgs.push("--http");
     if (cfg.otelTransport === "grpc" && process.platform === "win32") installArgs.push("--grpc");
+    // 透传 mongo-gray，保留用户首次装机时的 beta 灰度选择；不传等于 auto-update
+    // 把 beta 抹掉（mergeSettings 会 delete 残留的 ai_otel.mongo_gray attr）
+    if (cfg.mongoGrayTag) installArgs.push(`mongo-gray=${cfg.mongoGrayTag}`);
     runNpmToolSync("npx", installArgs, {
       stdio: "ignore",
       timeout: 120000,
