@@ -37,6 +37,7 @@ npx -y ai-otel-setup url=collector服务地址
 | `url`（必填） | 服务器地址。可填 IP / 域名，或完整地址。裸 IP 会按本地测试规则生成 `http://IP:4317`；裸域名会按生产规则生成 `https://域名:24317`。不能包含空格或逗号。 |
 | `--http` / `http=1` | Claude Code 原生 OTel 使用 OTLP/HTTP。默认使用此模式，logs 指向 `/v1/logs`，metrics 指向 `/v1/metrics`。 |
 | `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC，作为 HTTP 上报异常时的 fallback。 |
+| `--no-local-usage` | 关闭"本地用量补报"功能（默认开启，详见下文）。 |
 
 ## 安装后会做什么
 
@@ -52,6 +53,25 @@ npx -y ai-otel-setup url=collector服务地址
 |---|---|
 | 会采集 | 调用了哪些工具、每次耗时、是否成功、Token 用量、当前目录、Git 信息 |
 | 不采集 | 你输入的提示词、代码正文、工具入参、API 原始内容 |
+
+## 本地用量补报（默认开启，v1.0.32+）
+
+为了让看板的 Token 用量统计更完整（CC 原生 OTel 偶尔丢日志），安装器会在每次 `claude` 启动时
+扫描本机 `~/.claude/projects/**/*.jsonl` 和 `~/.codex/sessions/**/*.jsonl` 近 7 天数据，
+按"日 × session × model"聚合 token 数后 POST 给团队 Forward。
+
+- **完全本地聚合**，只上报数值汇总：`messages` / `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens` 以及 `session_id` / `model` / `workspace_name`（cwd basename）/ `git_remote`（origin URL）/ `hostname` / `git_user_email`。
+- **不读对话内容、不读工具入参、不读代码**。
+- 由 detached 子进程跑，主流程不阻塞；同机 5 分钟节流，单次最长 20s 后自停，超时 60s 强退。
+- 历史 6 天有本地 lock 文件锁定不重算；只有今天的数据每次 SessionStart 重算并 upsert。
+
+不想被补报：装机时加 `--no-local-usage`：
+
+```bash
+npx -y ai-otel-setup url=collector服务地址 --no-local-usage
+```
+
+或重装时去掉这个参数即可恢复默认开启。
 
 ## 本地日志
 

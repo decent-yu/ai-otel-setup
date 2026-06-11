@@ -167,10 +167,14 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
   }
 }
 
-// 仅在 mongoGrayTag 灰度安装时 spawn detached local-usage-scanner.js。
-// 本身有 5min/machine_id 节流，Stop / SessionStart 高频触发不会重复扫。
+// 全量装机默认 spawn detached local-usage-scanner.js（仅 SessionStart 触发，
+// 不再放到 Stop 分支，避免每轮 turn 多次 spawn 浪费 CPU / handle）。
+// 用户级 opt-out：endpoint.json.localUsageEnabled === false 时跳过。
+// 节流由 scanner 自身 5min/machine_id 控制。
 function spawnLocalUsageScanner(cfg) {
-  if (!cfg || !cfg.mongoGrayTag) return;
+  if (!cfg) return;
+  if (cfg.localUsageEnabled === false) return;
+  if (!cfg.localUsageUrl) return;
   const scannerPath = path.join(__dirname, "local-usage-scanner.js");
   try {
     if (!fs.existsSync(scannerPath)) return;
@@ -207,10 +211,11 @@ function spawnLocalUsageScanner(cfg) {
 
     // Stop 分流：不再发主 hook_session_start（那是 SessionStart 干的事），
     // 只在 mongoGrayTag 灰度时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
+    // 注意：local-usage-scanner 不在 Stop 触发——Stop 是每轮 turn 都触发的高频事件，
+    // 会让 detached 子进程数和 CPU 抖动放大；SessionStart 单点驱动已够覆盖每次启动。
     if (isStop) {
       const cfg = readInstallerConfig();
       spawnGitSnapshot(cfg, sessionId, "session_end", cwd);
-      spawnLocalUsageScanner(cfg);
       logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId });
       process.exit(0);
     }

@@ -193,13 +193,24 @@ function deriveRawUploadHost(hostname) {
   return parts.join(".");
 }
 
-// local-usage-scanner POST 目标：复用 rawUploadUrl 的 hostname，端口固定 8082，路径 /v1/local-usage
-// 由 forwarder 单独 listener 接收（独立 MySQL sink）
-function deriveLocalUsageUrl(rawUrl) {
+// local-usage-scanner POST 目标：直接从主 endpoint 派生，独立于 rawUploadUrl
+// （历史上 v1.0.31 用 rawUploadUrl 派生 + 端口 8082，导致没传 mongoGrayTag/upload-token 时
+// rawUploadUrl 为空 → localUsageUrl 也为空 → scanner 静默 skip。v1.0.32 解耦，让全量装机都可用。）
+//
+// 派生规则：
+//   - 域名应用 deriveRawUploadHost 改写（ai-otel.xxx → ai-otel-upload.xxx，与 rawUpload 同 host）
+//   - 非 IP / 非 localhost：清掉端口（走 ingress 默认 443/80，服务端 8090 在 ingress 后面）
+//   - IP / localhost：端口固定 8090（直连 raw-upload-server listener，与生产 ingress 同 port）
+//   - 路径固定 /v1/local-usage
+function deriveLocalUsageUrl(endpoint) {
   try {
-    if (!rawUrl) return "";
-    const u = new URL(rawUrl);
-    u.port = "8082";
+    const u = new URL(logsEndpointFromGrpc(endpoint));
+    u.hostname = deriveRawUploadHost(u.hostname);
+    if (!isIpHost(u.hostname) && !isLocalHost(u.hostname)) {
+      u.port = "";
+    } else {
+      u.port = "8090";
+    }
     u.pathname = "/v1/local-usage";
     u.search = "";
     u.hash = "";
@@ -1240,6 +1251,8 @@ async function main() {
   const rawUploadUrl =
     explicitRawUploadUrl ||
     (mongoGrayTag || rawUploadToken ? rawUploadUrlFromEndpoint(endpoint) : "");
+  // 本地用量补报全量开放：默认 enabled，--no-local-usage 关闭
+  const localUsageEnabled = !truthyFlag(args["no-local-usage"]);
   fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(rawBodiesDir, 0o700);
@@ -1329,8 +1342,11 @@ async function main() {
       gitSnapshotMaxFiles: 20,
       gitSnapshotMaxBytes: 1 * 1024 * 1024,
       gitSnapshotPerFileBytes: 256 * 1024,
-      // local-usage-scanner.js 读这个 URL 上报本地用量；从 rawUploadUrl 派生（同 hostname，端口换 8082，路径换 /v1/local-usage）
-      localUsageUrl: deriveLocalUsageUrl(rawUploadUrl),
+      // local-usage-scanner.js 读这个 URL 上报本地用量；从主 endpoint 独立派生
+      // （与 rawUploadUrl 同 hostname，但不再受 mongoGrayTag/upload-token 门控）
+      localUsageUrl: deriveLocalUsageUrl(endpoint),
+      // 用户级 opt-out：默认 true（全量开放）；--no-local-usage 装机时设为 false
+      localUsageEnabled,
     })
   );
 
@@ -1370,6 +1386,7 @@ async function main() {
   console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
   console.log(`  ${"transport".padEnd(12)}: ${otelTransport === "http" ? "http/protobuf" : "grpc"}`);
   console.log(`  ${"git email".padEnd(12)}: ${gitUser.email}`);
+  console.log(`  ${"local usage".padEnd(12)}: ${localUsageEnabled ? "enabled (用 --no-local-usage 关闭)" : "disabled"}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
@@ -1381,6 +1398,9 @@ async function main() {
       console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}${timerDetail}`);
     }
     if (mongoGrayTag) console.log(`  ${"mongo gray".padEnd(12)}: ${mongoGrayTag}`);
+    if (localUsageEnabled) {
+      console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
+    }
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
     if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);

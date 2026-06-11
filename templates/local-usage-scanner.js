@@ -7,8 +7,8 @@
  *
  * 关键约束：
  *   - 由 on-session-start.js spawn 出来的 detached 子进程，主 hook 不阻塞
- *   - 仅在 endpoint.json.mongoGrayTag 真值时跑（mongoGrayTag 灰度门控）
- *   - 5 分钟同 machine_id 内只跑一次（防 Stop / SessionStart 高频触发）
+ *   - 全量装机默认运行；endpoint.json.localUsageEnabled === false 时 skip（用户级 opt-out）
+ *   - 5 分钟同 machine_id 内只跑一次（防 SessionStart 高频触发）
  *   - 历史 6 天用 lock 文件跳过；今天总是重算并 upsert
  *   - 失败不冒泡：任何异常都不阻塞主 hook
  */
@@ -33,6 +33,22 @@ try {
 const WINDOW_DAYS = 7;
 const THROTTLE_MS = 5 * 60 * 1000;
 const POST_TIMEOUT_MS = 8000;
+const MAX_RUNTIME_MS = 20 * 1000; // 单次扫总耗时上限；watchdog 兜底 60s
+const WATCHDOG_MS = 60 * 1000;
+const MAX_ROLLS_PER_POST = 500; // 与服务端 maxRolls 对齐，超过本地切批
+
+// 降优先级：扫 jsonl 不与 CC 主进程争 IO/CPU。POSIX setPriority 在 Windows 上会 throw
+// （EPERM/ENOSYS），try/catch 包一下，失败也不影响功能。
+try {
+  if (typeof os.setPriority === "function") os.setPriority(0, 10);
+} catch (_) {}
+
+// Watchdog：scanner 卡在 readline / mysql 读时 60s 强退；保护用户机器
+const watchdog = setTimeout(() => {
+  logEvent("local_usage_watchdog_killed", {});
+  process.exit(1);
+}, WATCHDOG_MS);
+watchdog.unref();
 
 function readJSONSafe(p) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch (_) { return {}; }
@@ -114,14 +130,21 @@ function parseAssistantRow(line) {
   } catch (_) { return null; }
 }
 
-/** 从 cwd 的 .git/config 读 origin url（best effort，不跑 git 子进程） */
+/** 从 cwd 的 .git/config 读 origin url（best effort，不跑 git 子进程）
+ *  同一 cwd 跨 buckets 调用多次，加 cache 防重复磁盘读 */
+const gitRemoteCache = new Map();
 function tryReadGitRemote(cwd) {
+  if (!cwd) return "";
+  if (gitRemoteCache.has(cwd)) return gitRemoteCache.get(cwd);
+  let remote = "";
   try {
     const configPath = path.join(cwd, ".git", "config");
     const txt = fs.readFileSync(configPath, "utf8");
     const m = txt.match(/\[remote "origin"\][\s\S]*?url\s*=\s*(.+)/);
-    return m ? m[1].trim() : "";
-  } catch (_) { return ""; }
+    remote = m ? m[1].trim() : "";
+  } catch (_) {}
+  gitRemoteCache.set(cwd, remote);
+  return remote;
 }
 
 // ===== Codex 解析 =====
@@ -149,12 +172,13 @@ function sidFromCodexFilename(name) {
   return m ? m[1] : "";
 }
 
-async function aggregateCodex(targetDays, roots) {
+async function aggregateCodex(targetDays, roots, deadlineMs) {
   const targetSet = new Set(targetDays);
   const cutoffMs = Date.now() - (WINDOW_DAYS + 2) * 86400 * 1000;
   const buckets = new Map();
   for (const root of roots) {
     for await (const file of walkCodexJsonl(root)) {
+      if (deadlineMs && Date.now() > deadlineMs) return [...buckets.values()];
       let st;
       try { st = await fs.promises.stat(file); } catch (_) { continue; }
       if (st.mtimeMs < cutoffMs) continue;
@@ -221,12 +245,13 @@ async function aggregateCodex(targetDays, roots) {
   return [...buckets.values()];
 }
 
-async function aggregate(targetDays, projectsRoot) {
+async function aggregate(targetDays, projectsRoot, deadlineMs) {
   // key: `${day}|${sid}|${model}` → bucket
   const targetSet = new Set(targetDays);
   const cutoffMs = Date.now() - (WINDOW_DAYS + 2) * 86400 * 1000; // 留 2 天 buffer 防文件 mtime 早于 message ts
   const buckets = new Map();
   for await (const file of walkProjectFiles(projectsRoot)) {
+    if (deadlineMs && Date.now() > deadlineMs) return [...buckets.values()];
     let st;
     try { st = await fs.promises.stat(file); } catch (_) { continue; }
     if (st.mtimeMs < cutoffMs) continue;
@@ -288,12 +313,39 @@ function readUploadToken(installDir) {
   try { return fs.readFileSync(path.join(installDir, "raw-upload-token"), "utf8").trim(); } catch (_) { return ""; }
 }
 
+/** rolls > MAX_ROLLS_PER_POST 时切批分发，所有批都 2xx 才认为成功 */
+async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeoutMs) {
+  if (rolls.length === 0) return { ok: true, batches: 0, totalRolls: 0 };
+  const batches = [];
+  for (let i = 0; i < rolls.length; i += MAX_ROLLS_PER_POST) {
+    batches.push(rolls.slice(i, i + MAX_ROLLS_PER_POST));
+  }
+  let allOk = true;
+  let lastStatus = 0;
+  let lastError = "";
+  for (const batch of batches) {
+    const res = await postJson(url, { ...baseEnvelope, source, rolls: batch }, token, timeoutMs);
+    const ok = res.status >= 200 && res.status < 300;
+    if (!ok) {
+      allOk = false;
+      lastStatus = res.status;
+      lastError = res.error || (res.body || "").slice(0, 200);
+      // 单批失败立刻停：后续批同 endpoint 多半也失败，避免浪费
+      break;
+    }
+    lastStatus = res.status;
+  }
+  return { ok: allOk, batches: batches.length, totalRolls: rolls.length, status: lastStatus, error: lastError };
+}
+
 (async () => {
   try {
     const installDir = __dirname;
     const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
-    if (!cfg.mongoGrayTag) {
-      logEvent("local_usage_skip", { reason: "no_mongo_gray" });
+    // v1.0.32：去除 mongoGrayTag 门控，全量装机默认运行。
+    // 用户级 opt-out：localUsageEnabled === false 时跳过；老配置无此字段视同 true。
+    if (cfg.localUsageEnabled === false) {
+      logEvent("local_usage_skip", { reason: "user_opted_out" });
       return;
     }
     if (!cfg.localUsageUrl) {
@@ -310,6 +362,9 @@ function readUploadToken(installDir) {
       logEvent("local_usage_skip", { reason: "throttled" });
       return;
     }
+
+    const startedAt = nowMs;
+    const deadlineMs = startedAt + MAX_RUNTIME_MS;
 
     const today = shDayOf(nowMs);
     const window = buildWindow(nowMs);
@@ -354,16 +409,16 @@ function readUploadToken(installDir) {
     }
 
     // ===== CC =====
-    const ccBuckets = await aggregate(targetDays, path.join(os.homedir(), ".claude", "projects"));
+    const ccBuckets = await aggregate(targetDays, path.join(os.homedir(), ".claude", "projects"), deadlineMs);
     const ccRolls = bucketsToRolls(ccBuckets);
     let ccOk = true; // 默认 ok（无 rolls 视为不需要发）
     if (ccRolls.length > 0) {
-      const res = await postJson(cfg.localUsageUrl, { ...baseEnvelope, source: "cc", rolls: ccRolls }, token, POST_TIMEOUT_MS);
-      ccOk = res.status >= 200 && res.status < 300;
+      const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "cc", ccRolls, token, POST_TIMEOUT_MS);
+      ccOk = res.ok;
       if (ccOk) {
-        logEvent("local_usage_post_ok", { source: "cc", status: res.status, rolls: ccRolls.length });
+        logEvent("local_usage_post_ok", { source: "cc", batches: res.batches, rolls: res.totalRolls });
       } else {
-        logEvent("local_usage_post_fail", { source: "cc", status: res.status, error: res.error || (res.body || "").slice(0, 200) });
+        logEvent("local_usage_post_fail", { source: "cc", status: res.status, error: res.error });
       }
     } else {
       logEvent("local_usage_done", { source: "cc", reason: "no_rolls" });
@@ -373,16 +428,16 @@ function readUploadToken(installDir) {
     const codexBuckets = await aggregateCodex(targetDays, [
       path.join(os.homedir(), ".codex", "sessions"),
       path.join(os.homedir(), ".codex", "archived_sessions"),
-    ]);
+    ], deadlineMs);
     const codexRolls = bucketsToRolls(codexBuckets);
     let codexOk = true;
     if (codexRolls.length > 0) {
-      const res = await postJson(cfg.localUsageUrl, { ...baseEnvelope, source: "codex", rolls: codexRolls }, token, POST_TIMEOUT_MS);
-      codexOk = res.status >= 200 && res.status < 300;
+      const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "codex", codexRolls, token, POST_TIMEOUT_MS);
+      codexOk = res.ok;
       if (codexOk) {
-        logEvent("local_usage_post_ok", { source: "codex", status: res.status, rolls: codexRolls.length });
+        logEvent("local_usage_post_ok", { source: "codex", batches: res.batches, rolls: res.totalRolls });
       } else {
-        logEvent("local_usage_post_fail", { source: "codex", status: res.status, error: res.error || (res.body || "").slice(0, 200) });
+        logEvent("local_usage_post_fail", { source: "codex", status: res.status, error: res.error });
       }
     } else {
       logEvent("local_usage_done", { source: "codex", reason: "no_rolls" });
