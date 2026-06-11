@@ -10,7 +10,8 @@
     "OTEL_METRICS_INCLUDE_VERSION": "true",
     "OTEL_LOG_USER_PROMPTS": "0",
     "OTEL_LOG_TOOL_DETAILS": "1",
-    "OTEL_LOG_TOOL_CONTENT": "0"
+    "OTEL_LOG_TOOL_CONTENT": "0",
+    "OTEL_LOG_RAW_API_BODIES": "0"
   },
-  "_comment": "默认非 --beta 模式：TOOL_DETAILS=1 取 skill/plugin 真名（看板必需）；USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES 都关。--beta 装机时 buildEnv 会把这 3 个隐私 key 覆盖为 1 + 设 RAW_API_BODIES 文件路径。Installer 还会替换 OTEL_EXPORTER_OTLP_ENDPOINT (PLACEHOLDER_ENDPOINT)。"
+  "_comment": "默认非 --beta 模式：TOOL_DETAILS=1 取 skill/plugin 真名（看板必需）；USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES 都显式 \"0\"，不靠 CC 默认值兜底。--beta 装机时 buildEnv 会把这 3 个隐私 key 覆盖为 1 + 把 RAW_API_BODIES 改成 file:rawBodiesDir。Installer 还会替换 OTEL_EXPORTER_OTLP_ENDPOINT (PLACEHOLDER_ENDPOINT)。"
 }
