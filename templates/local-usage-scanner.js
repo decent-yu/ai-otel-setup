@@ -194,7 +194,9 @@ function tryReadGitRemote(cwd) {
 // 文件：~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl
 //      ~/.codex/archived_sessions/rollout-<ts>-<uuid>.jsonl
 // 关键差异（vs CC）：
-//   - token_count 事件是【累计值】，需 delta = curr.total - prev.total
+//   - token_count 事件用 last_token_usage（本轮增量）逐事件累加；不对 total_token_usage 做差分
+//     （对 compaction 重置/跳变免疫）。codex 的 input_tokens 含 cached_input_tokens、
+//     output_tokens 含 reasoning_output_tokens，累加时去重避免虚高。
 //   - model 在 turn_context 行里，可能跨 turn 变；逐事件跟随
 //   - session_id 在 session_meta.payload.id，与文件名 uuid 一致
 async function* walkCodexJsonl(root) {
@@ -228,7 +230,6 @@ async function aggregateCodex(targetDays, roots, deadlineMs) {
       let sessionId = sidFromCodexFilename(path.basename(file));
       let cwd = "";
       let currentModel = "";
-      let prev = null;
       const rl = readline.createInterface({ input: fs.createReadStream(file, "utf8"), crlfDelay: Infinity });
       for await (const line of rl) {
         if (!line) continue;
@@ -247,22 +248,18 @@ async function aggregateCodex(targetDays, roots, deadlineMs) {
             continue;
           }
           if (o.type !== "event_msg" || o.payload?.type !== "token_count") continue;
-          const u = o.payload.info?.total_token_usage;
+          // codex 语义：input_tokens 含 cached_input_tokens、output_tokens 含 reasoning_output_tokens。
+          // 用 last_token_usage（本轮增量；首条 baseline 的 info 为空 → 跳过）逐事件累加，
+          // 不对 total_token_usage 做差分：对 compaction（total 会重置/跳变）免疫，也无需维护 prev。
+          const u = o.payload.info?.last_token_usage;
           if (!u) continue;
-          const curr = {
-            input: Number(u.input_tokens || 0),
-            cache_r: Number(u.cached_input_tokens || 0),
-            output: Number(u.output_tokens || 0),
-            reasoning: Number(u.reasoning_output_tokens || 0),
+          const inputTotal = Number(u.input_tokens || 0);
+          const cacheRead = Number(u.cached_input_tokens || 0);
+          const turn = {
+            input: Math.max(0, inputTotal - cacheRead), // 非缓存新输入，对齐 OTel/CC（不把 cache 重复计进 input）
+            cache_r: cacheRead,
+            output: Number(u.output_tokens || 0),       // 已含 reasoning_output_tokens，不再另加
           };
-          // delta：第一条事件直接用累计值；之后用差值（避免负数 → 0 兜底）
-          const delta = prev ? {
-            input: Math.max(0, curr.input - prev.input),
-            cache_r: Math.max(0, curr.cache_r - prev.cache_r),
-            output: Math.max(0, curr.output - prev.output),
-            reasoning: Math.max(0, curr.reasoning - prev.reasoning),
-          } : curr;
-          prev = curr;
           const day = shDayOf(ts);
           if (!targetSet.has(day)) continue;
           if (!sessionId) continue;
@@ -274,9 +271,9 @@ async function aggregateCodex(targetDays, roots, deadlineMs) {
             buckets.set(key, b);
           }
           b.messages++;
-          b.input += delta.input;
-          b.output += delta.output + delta.reasoning; // reasoning_output 算进 output
-          b.cache_r += delta.cache_r;
+          b.input += turn.input;
+          b.output += turn.output;
+          b.cache_r += turn.cache_r;
           // codex 无 cache_w 概念，保持 0
           if (ts < b.first_ts) b.first_ts = ts;
           if (ts > b.last_ts) b.last_ts = ts;
