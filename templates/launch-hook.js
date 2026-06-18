@@ -24,7 +24,7 @@ try {
 const PACKAGE_NAME = "ai-otel-setup";
 const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const UPDATE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
-const RAW_UPLOAD_TRIGGER_INTERVAL_MS = 2 * 60 * 1000;
+const RAW_UPLOAD_TRIGGER_INTERVAL_MS = 60 * 1000;
 
 function readJSONSafe(file) {
   try {
@@ -193,7 +193,10 @@ function maybeSpawnRawUploader(nodeBin, installDir) {
   if (!writeJSONSafe(statePath, { ...state, lastAttemptAt: now, lastResult: "scheduled" })) return;
 
   try {
-    const child = spawn(nodeBin, [uploaderPath, "--once", "--max-runtime=25"], {
+    // detached + unref，不阻塞会话；uploader 内有 lock 防并发，故放大单次清空量：
+    // runtime 25→240s、files 50→2000、bytes 200MB→1GB，让 runtime 成为唯一瓶颈，
+    // 重度用户即便 Windows 定时器没生效，仅靠 hook 触发也能追上生成速度（约 1.3 文件/秒）。
+    const child = spawn(nodeBin, [uploaderPath, "--once", "--max-runtime=240", "--max-files=2000", "--max-bytes=1073741824"], {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
