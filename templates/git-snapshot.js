@@ -4,7 +4,7 @@
  *
  * 在 hook SessionStart / UserPromptSubmit / Stop 触发后，detached 收集工作区
  * git 快照并通过 OTLP/HTTP 上报。仅在 endpoint.json.fullUpload === true 时由
- * on-session-start.js spawn 出来（--beta 全量上报场景）。
+ * on-session-start.js spawn 出来（全量上报场景）。
  *
  * 双轨数据流：
  *   - 本地 git ref（真值）：每次事件落一个隐藏 commit 到

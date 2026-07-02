@@ -173,7 +173,7 @@ function readPromptIdFromTranscript(transcriptPath) {
   } catch (_) { return ""; }
 }
 
-// 仅在 fullUpload (--beta) 安装时 spawn detached git-snapshot.js，不阻塞主 hook。
+// 仅在 fullUpload 安装时 spawn detached git-snapshot.js，不阻塞主 hook。
 // 节流已移除（2026-06）；截断、POST、本地 snapshot ref 创建都在 snapshot 脚本里做。
 // hookKind 保留为旧字段（session_start | session_end）保持后端 query 兼容；
 // eventKind 是新字段（session_start | user_prompt | stop），细粒度区分。
@@ -245,7 +245,7 @@ function spawnLocalUsageScanner(cfg) {
     const isStop = hookEventName === "Stop";
 
     // Stop 分流：不再发主 hook_session_start（那是 SessionStart 干的事），
-    // 只在 fullUpload (--beta) 时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
+    // 只在 fullUpload 时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
     // 注意：local-usage-scanner 不在 Stop 触发——Stop 是每轮 turn 都触发的高频事件，
     // 会让 detached 子进程数和 CPU 抖动放大；SessionStart 单点驱动已够覆盖每次启动。
     if (isStop) {
@@ -374,7 +374,7 @@ function spawnLocalUsageScanner(cfg) {
     req.write(payload);
     req.end();
 
-    // 仅在 fullUpload (--beta) 时 spawn detached git snapshot 子进程。
+    // 仅在 fullUpload 时 spawn detached git snapshot 子进程。
     // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
     // event_kind 区分 user_prompt vs session_start；hook_kind 保持旧值给后端兼容。
     // promptUuid：UserPromptSubmit 时 transcript 已写入该 prompt 的 user message；

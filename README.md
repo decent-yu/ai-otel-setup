@@ -37,6 +37,7 @@ npx -y ai-otel-setup url=collector服务地址
 | `url`（必填） | 服务器地址。可填 IP / 域名，或完整地址。裸 IP 会按本地测试规则生成 `http://IP:4317`；裸域名会按生产规则生成 `https://域名:24317`。不能包含空格或逗号。 |
 | `--http` / `http=1` | Claude Code 原生 OTel 使用 OTLP/HTTP。默认使用此模式，logs 指向 `/v1/logs`，metrics 指向 `/v1/metrics`。 |
 | `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC，作为 HTTP 上报异常时的 fallback。 |
+| `--no-full-upload` | 关闭全量数据上报旁路（raw body + git snapshot）。默认已开启全量上报。 |
 
 ## 安装后会做什么
 
@@ -51,7 +52,7 @@ npx -y ai-otel-setup url=collector服务地址
 | 类型 | 内容 |
 |---|---|
 | 会采集 | 调用了哪些工具、每次耗时、是否成功、Token 用量、当前目录、Git 信息 |
-| 不采集 | 你输入的提示词、代码正文、工具入参、API 原始内容 |
+| 仅全量上报旁路采集 | raw body 与 git snapshot，用于完整排查和全量数据看板 |
 
 ## 本地用量补报
 
@@ -84,7 +85,7 @@ ls ~/.claude/settings.json.bak.* | tail -1 | xargs -I{} cp {} ~/.claude/settings
 rm -rf ~/.claude/cc-otel
 ```
 
-如果你装过 `--beta`，系统级 raw body 上传 timer 也要清掉：
+系统级 raw body 上传 timer 也要清掉：
 
 ```bash
 # macOS
@@ -99,7 +100,7 @@ rm -f ~/.config/systemd/user/ai-otel-raw-uploader.{service,timer}
 schtasks /Delete /F /TN ai-otel-raw-uploader
 ```
 
-> 提示：不想卸载、只想关掉 raw body 上报？直接**重跑安装命令不加 `--beta`**，
+> 提示：不想卸载、只想关掉 raw body 上报？直接重跑安装命令并加 `--no-full-upload`，
 > installer 会自动 uninstall timer + 把 settings.json 里的隐私 env（USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES）改回 0/删除。`~/.claude/cc-otel/raw-bodies/` 目录里
 > 残留的 body 文件不会被自动清理，可以放心手动删。
 

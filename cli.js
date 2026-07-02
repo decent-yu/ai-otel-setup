@@ -146,6 +146,16 @@ function validateArgs(args) {
   if (truthyFlag(args.http) && truthyFlag(args.grpc)) {
     errs.push("--http 与 --grpc 不能同时使用");
   }
+  if (
+    Object.prototype.hasOwnProperty.call(args, "beta") ||
+    Object.prototype.hasOwnProperty.call(args, "full-upload") ||
+    Object.prototype.hasOwnProperty.call(args, "--beta") ||
+    Object.prototype.hasOwnProperty.call(args, "--full-upload") ||
+    Object.prototype.hasOwnProperty.call(args, "-beta") ||
+    Object.prototype.hasOwnProperty.call(args, "-full-upload")
+  ) {
+    errs.push("--beta / --full-upload 已不再支持：全量数据上报默认开启；如需关闭请使用 --no-full-upload");
+  }
   for (const k of REQUIRED_KEYS) {
     if (!args[k]) {
       errs.push(`missing required: ${k}`);
@@ -212,21 +222,6 @@ function deriveLocalUsageUrl(endpoint) {
       u.port = "8090";
     }
     u.pathname = "/v1/local-usage";
-    u.search = "";
-    u.hash = "";
-    return u.toString().replace(/\/+$/, "");
-  } catch (_) {
-    return "";
-  }
-}
-
-// 灰度判定接口 URL：与 localUsageUrl 同源（raw-upload-server :8090 / ingress），仅换 path。
-function deriveGrayCheckUrl(endpoint) {
-  try {
-    const u = new URL(logsEndpointFromGrpc(endpoint));
-    u.hostname = deriveRawUploadHost(u.hostname);
-    u.port = !isIpHost(u.hostname) && !isLocalHost(u.hostname) ? "" : "8090";
-    u.pathname = "/v1/gray-check";
     u.search = "";
     u.hash = "";
     return u.toString().replace(/\/+$/, "");
@@ -460,66 +455,6 @@ function postJsonWithTimeout(targetUrl, payload, timeoutMs) {
   });
 }
 
-// GET + JSON 解析，带超时和 64KB 响应体上限。任何失败 reject，由 checkGray 兜成 null。
-function httpGetJsonWithTimeout(targetUrl, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let u;
-    try {
-      u = new URL(targetUrl);
-    } catch (e) {
-      return reject(e);
-    }
-    const isHttps = u.protocol === "https:";
-    const lib = isHttps ? require("https") : require("http");
-    const req = lib.request(
-      {
-        method: "GET",
-        hostname: u.hostname,
-        port: u.port || (isHttps ? 443 : 80),
-        path: (u.pathname || "/") + (u.search || ""),
-        timeout: timeoutMs,
-      },
-      (res) => {
-        const chunks = [];
-        let total = 0;
-        res.on("data", (c) => {
-          total += c.length;
-          if (total > 65536) {
-            req.destroy(new Error("response too large"));
-            return;
-          }
-          chunks.push(c);
-        });
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-          } catch (e) {
-            reject(e);
-          }
-        });
-        res.on("error", reject);
-      }
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy(new Error("timeout"));
-    });
-    req.end();
-  });
-}
-
-// 灰度判定：true=命中灰度 / false=确认非灰度 / null=超时或不可达（调用方保留上次状态）。
-async function checkGray(endpoint, email) {
-  const url = deriveGrayCheckUrl(endpoint);
-  if (!url || !email) return null;
-  try {
-    const res = await httpGetJsonWithTimeout(`${url}?email=${encodeURIComponent(email)}`, 3000);
-    return !!(res && res.gray === true);
-  } catch (_) {
-    return null;
-  }
-}
-
 async function reportInstall(otelEndpoint, gitUser, allResults, debug, fullUpload) {
   if (!gitUser || !gitUser.email) {
     if (debug) console.error("[ai-otel-setup] 跳过装机上报：无 git user.email");
@@ -684,10 +619,10 @@ function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir, fullUpl
   } else {
     env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
   }
-  // fullUpload (--beta) 时显式打开 3 个隐私 key + 写 RAW_API_BODIES 文件路径；
-  // 非 beta 模式由 settings.template.json 默认值兜底（USER_PROMPTS=0 / TOOL_CONTENT=0 / 不写 RAW_API_BODIES）。
+  // fullUpload 默认开启；显式 --no-full-upload 时由 settings.template.json 的安全默认值兜底
+  // （USER_PROMPTS=0 / TOOL_CONTENT=0 / 不写 RAW_API_BODIES）。
   // OTEL_KEYS 在 mergeSettings 里走 "has → overwrite，没有 → delete" 语义，所以
-  // 切回非 beta 时上一轮残留的 RAW_API_BODIES 会被自动清掉。
+  // 切回非 fullUpload 时上一轮残留的 RAW_API_BODIES 会被自动清掉。
   if (fullUpload) {
     env.OTEL_LOG_USER_PROMPTS = "1";
     env.OTEL_LOG_TOOL_CONTENT = "1";
@@ -717,9 +652,8 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEnt
   if (machineId) {
     const attrs = parseResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES || "");
     attrs["ai_otel.machine_id"] = machineId;
-    // 全量上报开启：写 ai_otel.mongo_gray=beta（服务端 mongo-full sink 当前
-    // 仍按此 attr 过滤，故 attr 名暂保留；下次发版服务端改完后可一起改名）。
-    // 关闭：显式 delete，让"--beta 重装 → 不 --beta 重装"能彻底卸下。
+    // 全量上报开启：写 ai_otel.mongo_gray=beta（服务端 mongo-full sink 当前仍按此 attr
+    // 过滤，故 attr 名暂保留）。关闭：显式 delete，让 --no-full-upload 能彻底卸下。
     if (fullUpload) attrs["ai_otel.mongo_gray"] = "beta";
     else delete attrs["ai_otel.mongo_gray"];
     merged.env.OTEL_RESOURCE_ATTRIBUTES = serializeResourceAttrs(attrs);
@@ -1061,8 +995,8 @@ function installRawUploaderTimer(installDir) {
 }
 
 // 卸载之前装机留下的 raw-uploader timer。三种触发场景共用：
-//   1. 非 --beta 装机：每次都跑一次 uninstall，把残留干掉（幂等，没残留就 no-op）
-//   2. 重装 --beta 装机：install 之前先 uninstall（旧的 plist/unit 内容可能旧版本，刷新）
+//   1. --no-full-upload 装机：每次都跑一次 uninstall，把残留干掉（幂等，没残留就 no-op）
+//   2. fullUpload 装机：install 之前先 uninstall（旧的 plist/unit 内容可能旧版本，刷新）
 //   3. （未来）显式 cleanup 子命令
 // 失败不抛错，最差就是 launchd/systemd/schtasks 里残一份；状态字段给主流程拿来打日志。
 function uninstallMacRawUploaderTimer() {
@@ -1547,25 +1481,15 @@ async function main() {
   const machineId = getOrCreateMachineId(installDir);
   const rawBodiesDir = path.join(installDir, "raw-bodies");
   const rawUploadToken = args["upload-token"] || args.uploadtoken || "";
-  // 全量数据上报开关，优先级：① 显式 --beta/--full-upload ② 服务端灰度名单 ③ 超时→保留上次状态。
-  // 灰度名单只能"额外开启"（enroll-only）；--beta 永远优先，名单关不掉显式开过的人。
-  // 下次发版（灰度结束）时把默认翻转成 true，opt-out 改 --no-full-upload。
-  let fullUpload = truthyFlag(args.beta) || truthyFlag(args["full-upload"]);
-  if (!fullUpload) {
-    const gray = await checkGray(endpoint, gitUser.email); // true / false / null(超时或不可达)
-    if (gray === true) {
-      fullUpload = true;
-    } else if (gray === null) {
-      // 接口超时/不可达：保留 endpoint.json 上次状态，避免偶发失败把已灰度老用户误关（抖动）。
-      fullUpload = readJSONSafe(path.join(installDir, "endpoint.json")).fullUpload === true;
-    }
-  }
+  // 全量数据上报默认开启；需要临时关闭时显式传 --no-full-upload，并写盘给 auto-update 续传。
+  const fullUploadOptOut = truthyFlag(args["no-full-upload"]);
+  const fullUpload = !fullUploadOptOut;
   const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
-  // rawUploadUrl 唯一来源：fullUpload（--beta）；显式 --upload-url 仍可强制覆盖。
-  // 非 beta 用户不需要这个 URL，scanner/raw-body-uploader 都不会跑。
+  // rawUploadUrl 唯一来源：fullUpload；显式 --upload-url 仍可强制覆盖。
+  // opt-out 用户不需要这个 URL，scanner/raw-body-uploader 都不会跑。
   const rawUploadUrl = explicitRawUploadUrl || (fullUpload ? rawUploadUrlFromEndpoint(endpoint) : "");
   // raw-bodies 目录只在 fullUpload 时建（CC 才会写盘 raw API body）；
-  // 非 beta 用户曾经装过 beta 的话，目录里残留文件保留，由用户手动清。
+  // opt-out 用户曾经开过 fullUpload 的话，目录里残留文件保留，由用户手动清。
   if (fullUpload) {
     fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
     try { fs.chmodSync(rawBodiesDir, 0o700); } catch (_) {}
@@ -1604,7 +1528,7 @@ async function main() {
   };
 
   // Stop hook：复用 on-session-start.js（按 hook_event_name=Stop 在脚本内分流）。
-  // 仅在 fullUpload (--beta) 时实际触发 git snapshot；非全量场景脚本会立即 noop 退出。
+  // 仅在 fullUpload 时实际触发 git snapshot；非全量场景脚本会立即 noop 退出。
   const stopHookEntry = {
     matcher: "*",
     hooks: [
@@ -1615,7 +1539,7 @@ async function main() {
       },
     ],
     description:
-      "ai-otel-setup 注入：Stop 触发 git snapshot（仅 --beta 全量上报时启用）",
+      "ai-otel-setup 注入：Stop 触发 git snapshot（仅全量上报时启用）",
     id: STOP_HOOK_ID,
   };
 
@@ -1654,6 +1578,7 @@ async function main() {
       rawUploadChunkBytes: 4 * 1024 * 1024,
       hasUploadToken: !!rawUploadToken,
       fullUpload,
+      fullUploadOptOut,
       gitUserEmail: gitUser.email,
       // git-snapshot.js 读这三个字段做三轴截断；默认值在 snapshot 脚本内兜底
       gitSnapshotMaxFiles: 20,
@@ -1711,7 +1636,8 @@ async function main() {
       const timerDetail = rawUploaderTimer.path ? ` (${rawUploaderTimer.path})` : rawUploaderTimer.reason ? ` (${rawUploaderTimer.reason})` : "";
       console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}${timerDetail}`);
     }
-    if (fullUpload) console.log(`  ${"mode".padEnd(12)}: beta (full upload)`);
+    if (fullUpload) console.log(`  ${"mode".padEnd(12)}: full upload`);
+    else console.log(`  ${"mode".padEnd(12)}: full upload disabled`);
     console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
@@ -1765,8 +1691,8 @@ function printUsage() {
 可选：
   --http | http=1    Claude Code 原生 OTel 使用 OTLP/HTTP（默认）
   --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
-  --beta             开启全量数据上报旁路（raw body + git snapshot），灰度阶段须显式传入
-  upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；灰度安装时不传会按 url 自动推导 raw-upload 域名
+  --no-full-upload   关闭全量数据上报旁路（raw body + git snapshot）
+  upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；不传会按 url 自动推导 raw-upload 域名
   upload-token=TOKEN raw body 上传 Bearer token（可选；仅服务端开启鉴权时需要，传入时写入本地 0600 token 文件）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);

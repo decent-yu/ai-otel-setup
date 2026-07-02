@@ -13,5 +13,5 @@
     "OTEL_LOG_TOOL_CONTENT": "0",
     "OTEL_LOG_RAW_API_BODIES": "0"
   },
-  "_comment": "默认非 --beta 模式：TOOL_DETAILS=1 取 skill/plugin 真名（看板必需）；USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES 都显式 \"0\"，不靠 CC 默认值兜底。--beta 装机时 buildEnv 会把这 3 个隐私 key 覆盖为 1 + 把 RAW_API_BODIES 改成 file:rawBodiesDir。Installer 还会替换 OTEL_EXPORTER_OTLP_ENDPOINT (PLACEHOLDER_ENDPOINT)。"
+  "_comment": "默认开启 full upload 时 buildEnv 会把 USER_PROMPTS / TOOL_CONTENT 覆盖为 1，并把 RAW_API_BODIES 改成 file:rawBodiesDir。显式 --no-full-upload 时使用这里的安全默认值：TOOL_DETAILS=1 取 skill/plugin 真名（看板必需）；USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES 为 0。Installer 还会替换 OTEL_EXPORTER_OTLP_ENDPOINT (PLACEHOLDER_ENDPOINT)。"
 }
