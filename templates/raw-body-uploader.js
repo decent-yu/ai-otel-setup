@@ -29,7 +29,10 @@ const DEFAULT_MAX_BYTES = 200 * 1024 * 1024;
 const DEFAULT_STABLE_AGE_MS = 15 * 1000;
 const DEFAULT_SENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RAW_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const DEFAULT_SOFT_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_SOFT_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_HARD_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_TARGET_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 const LOCK_STALE_MS = 30 * 60 * 1000;
 
 function readJSONSafe(file) {
@@ -56,6 +59,11 @@ function parseArgs(argv) {
     else if (arg.startsWith("--max-bytes=")) out.maxBytes = Number(arg.slice("--max-bytes=".length));
   }
   return out;
+}
+
+function cfgBytes(cfg, key, defaultVal) {
+  const n = Number(cfg && cfg[key]);
+  return Number.isFinite(n) && n > 0 ? n : defaultVal;
 }
 
 function sha256Buffer(buf) {
@@ -294,6 +302,29 @@ async function moveToSent(file) {
   return dest;
 }
 
+function discardedPathFor(file, reason) {
+  const d = new Date().toISOString().slice(0, 10);
+  const safeReason = String(reason || "disk_guard").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 60);
+  return path.join(UPLOADER_DIR, "discarded", d, safeReason, path.basename(file));
+}
+
+async function moveToDiscarded(file, reason) {
+  const dest = discardedPathFor(file, reason);
+  await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+  try {
+    await fs.promises.rename(file, dest);
+  } catch (_) {
+    await fs.promises.copyFile(file, dest);
+    await fs.promises.unlink(file);
+  }
+  return dest;
+}
+
+async function discardRawFile(file, reason) {
+  await fs.promises.unlink(file);
+  return "";
+}
+
 function backoffMs(failures) {
   const steps = [60, 5 * 60, 15 * 60, 60 * 60, 6 * 60 * 60];
   return steps[Math.min(Math.max(failures - 1, 0), steps.length - 1)] * 1000;
@@ -302,6 +333,22 @@ function backoffMs(failures) {
 function errorText(err) {
   if (!err) return "unknown";
   return String(err.stack || err.message || err).slice(0, 500);
+}
+
+function isServerCapabilityError(err) {
+  return /inline raw body upload only supports single chunk/i.test(errorText(err));
+}
+
+function isDiscardableUploadError(err) {
+  const text = errorText(err);
+  return /HTTP 413\b/.test(text) ||
+    /file_size exceeds max/i.test(text) ||
+    /chunk_count exceeds max/i.test(text);
+}
+
+function nextBackoffMs(err, failures) {
+  if (isServerCapabilityError(err)) return 24 * 60 * 60 * 1000;
+  return backoffMs(failures);
 }
 
 async function uploadFile(file, stat, cfg, token) {
@@ -391,14 +438,167 @@ async function cleanupSent(now) {
   }
 }
 
-async function rawDirSize(dir) {
+async function cleanupDiscarded(now) {
+  const root = path.join(UPLOADER_DIR, "discarded");
+  let dateDirs;
+  try {
+    dateDirs = await fs.promises.readdir(root, { withFileTypes: true });
+  } catch (_) {
+    return;
+  }
+  for (const dateDir of dateDirs) {
+    if (!dateDir.isDirectory()) continue;
+    const datePath = path.join(root, dateDir.name);
+    let reasonDirs = [];
+    try {
+      reasonDirs = await fs.promises.readdir(datePath, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+    for (const reasonDir of reasonDirs) {
+      if (!reasonDir.isDirectory()) continue;
+      const dir = path.join(datePath, reasonDir.name);
+      let names = [];
+      try {
+        names = await fs.promises.readdir(dir);
+      } catch (_) {
+        continue;
+      }
+      const items = [];
+      for (const name of names) {
+        const file = path.join(dir, name);
+        try {
+          const st = await fs.promises.stat(file);
+          items.push({ file, mtimeMs: st.mtimeMs });
+        } catch (_) {}
+      }
+      items.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      for (let i = 0; i < items.length; i++) {
+        try {
+          if (now - items[i].mtimeMs > DEFAULT_SENT_RETENTION_MS) await fs.promises.unlink(items[i].file);
+        } catch (_) {}
+      }
+    }
+  }
+}
+
+async function rawDirInventory(dir) {
   let total = 0;
+  const files = [];
   for await (const file of walkRawFiles(dir)) {
     try {
-      total += (await fs.promises.stat(file)).size;
+      const st = await fs.promises.stat(file);
+      total += st.size;
+      files.push({ file, size: st.size, mtimeMs: st.mtimeMs });
     } catch (_) {}
   }
-  return total;
+  return { total, files };
+}
+
+async function freeBytesFor(dir) {
+  if (!fs.promises.statfs) return null;
+  try {
+    const st = await fs.promises.statfs(dir);
+    return Number(st.bavail) * Number(st.bsize);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function applyDiskGuard(rawBodiesDir, cfg, state, phase) {
+  const softLimit = cfgBytes(cfg, "rawBodiesSoftLimitBytes", DEFAULT_SOFT_LIMIT_BYTES);
+  const hardLimit = cfgBytes(cfg, "rawBodiesHardLimitBytes", DEFAULT_HARD_LIMIT_BYTES);
+  const targetLimit = Math.min(cfgBytes(cfg, "rawBodiesTargetLimitBytes", DEFAULT_TARGET_LIMIT_BYTES), hardLimit);
+  const minFree = cfgBytes(cfg, "rawBodiesMinFreeBytes", DEFAULT_MIN_FREE_BYTES);
+  const inventory = await rawDirInventory(rawBodiesDir);
+  const freeBytes = await freeBytesFor(rawBodiesDir);
+  const lowFree = freeBytes !== null && freeBytes < minFree;
+
+  state.diskGuard = {
+    ...(state.diskGuard || {}),
+    lastCheckedAt: new Date().toISOString(),
+    rawBodiesBytes: inventory.total,
+    freeBytes: freeBytes === null ? "" : freeBytes,
+    softLimitBytes: softLimit,
+    hardLimitBytes: hardLimit,
+    targetLimitBytes: targetLimit,
+    minFreeBytes: minFree,
+  };
+
+  if (inventory.total > softLimit) {
+    logEvent("raw_uploader_soft_limit_exceeded", {
+      phase,
+      bytes: inventory.total,
+      freeBytes: freeBytes === null ? "" : freeBytes,
+      softLimitBytes: softLimit,
+    });
+  }
+
+  if (inventory.total <= hardLimit && !lowFree) {
+    return { rawBodiesBytes: inventory.total, discardedFiles: 0, discardedBytes: 0 };
+  }
+
+  inventory.files.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  let current = inventory.total;
+  let discardedFiles = 0;
+  let discardedBytes = 0;
+  const reason = lowFree ? "low_free_space" : "raw_bodies_hard_limit";
+  const examples = [];
+
+  const stopAtBytes = lowFree ? 0 : targetLimit;
+  for (const item of inventory.files) {
+    if (current <= stopAtBytes) break;
+    const fileName = path.basename(item.file);
+    const key = sourceFileKey(cfg.machineId || "", item.file, { size: item.size, mtimeMs: item.mtimeMs });
+    try {
+      const dest = await discardRawFile(item.file, reason);
+      current -= item.size;
+      discardedFiles += 1;
+      discardedBytes += item.size;
+      state.files[key] = {
+        ...(state.files[key] || {}),
+        uploaded: false,
+        discarded: true,
+        discardedAt: new Date().toISOString(),
+        discardReason: reason,
+        fileName,
+        bodyKind: fileBodyKind(fileName),
+        bytes: item.size,
+        mtimeMs: Math.floor(item.mtimeMs),
+        discardedPath: dest,
+      };
+      if (examples.length < 5) examples.push(`${fileName}:${item.size}`);
+    } catch (e) {
+      logEvent("raw_uploader_discard_failed", {
+        file: fileName,
+        bytes: item.size,
+        reason,
+        error: errorText(e),
+      });
+    }
+  }
+
+  if (discardedFiles) {
+    state.diskGuard = {
+      ...(state.diskGuard || {}),
+      lastDiscardAt: new Date().toISOString(),
+      lastDiscardReason: reason,
+      lastDiscardedFiles: discardedFiles,
+      lastDiscardedBytes: discardedBytes,
+      rawBodiesBytesAfterDiscard: current,
+    };
+    logEvent("raw_uploader_disk_guard_discarded", {
+      phase,
+      reason,
+      discardedFiles,
+      discardedBytes,
+      rawBodiesBytesBefore: inventory.total,
+      rawBodiesBytesAfter: current,
+      examples: examples.join(","),
+    });
+  }
+
+  return { rawBodiesBytes: current, discardedFiles, discardedBytes };
 }
 
 async function run() {
@@ -432,6 +632,13 @@ async function run() {
     let uploadedFiles = 0;
     let uploadedBytes = 0;
     let failedFiles = 0;
+    let discardedFiles = 0;
+    let discardedBytes = 0;
+
+    const preGuard = await applyDiskGuard(rawBodiesDir, cfg, state, "before_upload");
+    discardedFiles += preGuard.discardedFiles;
+    discardedBytes += preGuard.discardedBytes;
+    if (preGuard.discardedFiles) writeJSONAtomic(STATE_FILE, state);
 
     for await (const file of walkRawFiles(rawBodiesDir)) {
       if (Date.now() - startedAt > maxRuntimeMs) break;
@@ -439,6 +646,8 @@ async function run() {
 
       const stat = await stableStat(file);
       if (!stat) continue;
+      const fileName = path.basename(file);
+      const bodyKind = fileBodyKind(fileName);
       if (Date.now() - stat.mtimeMs > DEFAULT_RAW_RETENTION_MS && state.files[path.basename(file)]?.uploaded) {
         try {
           await fs.promises.unlink(file);
@@ -455,7 +664,9 @@ async function run() {
         continue;
       }
       const nextAttemptAt = Number(item.nextAttemptAt || 0);
-      if (nextAttemptAt && Date.now() < nextAttemptAt) continue;
+      if (nextAttemptAt && Date.now() < nextAttemptAt) {
+        if (!(cfg.rawUploadMultipart && item.blockedByServerCapability)) continue;
+      }
 
       try {
         const result = await uploadFile(file, stat, cfg, token);
@@ -463,38 +674,74 @@ async function run() {
         state.files[key] = {
           uploaded: true,
           uploadedAt: new Date().toISOString(),
+          fileName,
+          bodyKind,
           bytes: result.bytes,
+          mtimeMs: Math.floor(stat.mtimeMs),
           contentSha256: result.contentSha256,
         };
         uploadedFiles += 1;
         uploadedBytes += stat.size;
-        logEvent("raw_uploader_file_uploaded", { file: path.basename(file), bytes: stat.size });
+        logEvent("raw_uploader_file_uploaded", { file: fileName, bytes: stat.size });
       } catch (e) {
         failedFiles += 1;
         const failures = Number(item.failures || 0) + 1;
-        state.files[key] = {
+        const entry = {
           ...item,
           uploaded: false,
+          fileName,
+          bodyKind,
+          bytes: stat.size,
+          mtimeMs: Math.floor(stat.mtimeMs),
           failures,
           lastError: errorText(e),
           lastAttemptAt: new Date().toISOString(),
-          nextAttemptAt: Date.now() + backoffMs(failures),
+          nextAttemptAt: Date.now() + nextBackoffMs(e, failures),
         };
+        if (isServerCapabilityError(e)) entry.blockedByServerCapability = true;
+        state.files[key] = entry;
         logEvent("raw_uploader_file_failed", {
-          file: path.basename(file),
+          file: fileName,
+          bytes: stat.size,
           failures,
           error: state.files[key].lastError,
         });
+        if (isDiscardableUploadError(e)) {
+          try {
+            const dest = await discardRawFile(file, "upload_rejected");
+            state.files[key] = {
+              ...state.files[key],
+              discarded: true,
+              discardedAt: new Date().toISOString(),
+              discardReason: "upload_rejected",
+              discardedPath: dest,
+            };
+            discardedFiles += 1;
+            discardedBytes += stat.size;
+            logEvent("raw_uploader_file_discarded", {
+              file: fileName,
+              bytes: stat.size,
+              reason: "upload_rejected",
+            });
+          } catch (discardErr) {
+            logEvent("raw_uploader_discard_failed", {
+              file: fileName,
+              bytes: stat.size,
+              reason: "upload_rejected",
+              error: errorText(discardErr),
+            });
+          }
+        }
       }
 
       writeJSONAtomic(STATE_FILE, state);
     }
 
     await cleanupSent(Date.now());
-    const size = await rawDirSize(rawBodiesDir);
-    if (size > DEFAULT_SOFT_LIMIT_BYTES) {
-      logEvent("raw_uploader_soft_limit_exceeded", { bytes: size });
-    }
+    await cleanupDiscarded(Date.now());
+    const postGuard = await applyDiskGuard(rawBodiesDir, cfg, state, "after_upload");
+    discardedFiles += postGuard.discardedFiles;
+    discardedBytes += postGuard.discardedBytes;
     writeJSONAtomic(STATE_FILE, {
       ...state,
       lastRunAt: new Date().toISOString(),
@@ -502,8 +749,10 @@ async function run() {
       lastUploadedFiles: uploadedFiles,
       lastUploadedBytes: uploadedBytes,
       lastFailedFiles: failedFiles,
+      lastDiscardedFiles: discardedFiles,
+      lastDiscardedBytes: discardedBytes,
     });
-    logEvent("raw_uploader_done", { uploadedFiles, uploadedBytes, failedFiles });
+    logEvent("raw_uploader_done", { uploadedFiles, uploadedBytes, failedFiles, discardedFiles, discardedBytes });
   } finally {
     releaseLock(lockFd);
   }
