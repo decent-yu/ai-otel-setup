@@ -86,13 +86,6 @@ try {
   if (typeof os.setPriority === "function") os.setPriority(0, 10);
 } catch (_) {}
 
-// Watchdog：scanner 卡在 readline / mysql 读时 60s 强退；保护用户机器
-const watchdog = setTimeout(() => {
-  logEvent("local_usage_watchdog_killed", {});
-  process.exit(1);
-}, WATCHDOG_MS);
-watchdog.unref();
-
 function readJSONSafe(p) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch (_) { return {}; }
 }
@@ -194,9 +187,11 @@ function tryReadGitRemote(cwd) {
 // 文件：~/.codex/sessions/<Y>/<M>/<D>/rollout-<ts>-<uuid>.jsonl
 //      ~/.codex/archived_sessions/rollout-<ts>-<uuid>.jsonl
 // 关键差异（vs CC）：
-//   - token_count 事件用 last_token_usage（本轮增量）逐事件累加；不对 total_token_usage 做差分
-//     （对 compaction 重置/跳变免疫）。codex 的 input_tokens 含 cached_input_tokens、
-//     output_tokens 含 reasoning_output_tokens，累加时去重避免虚高。
+//   - token_count 事件可能在流式响应期间高频刷新，last_token_usage 会重复出现；
+//     不能逐事件累加。优先对 total_token_usage 做累计快照差分，并跨 files 去重同一
+//     session 的重复快照；total reset（compaction / 新段）时才回退到 last_token_usage。
+//   - codex 的 input_tokens 含 cached_input_tokens、output_tokens 含 reasoning_output_tokens，
+//     累加时去重避免虚高。
 //   - model 在 turn_context 行里，可能跨 turn 变；逐事件跟随
 //   - session_id 在 session_meta.payload.id，与文件名 uuid 一致
 async function* walkCodexJsonl(root) {
@@ -212,74 +207,156 @@ async function* walkCodexJsonl(root) {
   }
 }
 
+async function collectCodexJsonl(roots) {
+  const files = [];
+  for (const root of roots) {
+    for await (const file of walkCodexJsonl(root)) files.push(file);
+  }
+  // sessions 与 archived_sessions 可能同时含同一会话文件；稳定按文件名时间顺序扫，
+  // 让 total_token_usage 差分有单调基线，重复/旧快照由 seenTotals 兜底跳过。
+  files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)) || a.localeCompare(b));
+  return files;
+}
+
 function sidFromCodexFilename(name) {
   const m = name.match(/rollout-[\d\-T]+-([0-9a-f-]{36})\.jsonl/i);
   return m ? m[1] : "";
+}
+
+function normalizeCodexUsage(u) {
+  if (!u || typeof u !== "object") return null;
+  const inputTotal = Number(u.input_tokens || 0);
+  const cacheRead = Number(u.cached_input_tokens || 0);
+  const output = Number(u.output_tokens || 0);
+  const input = Math.max(0, inputTotal - cacheRead);
+  if (input <= 0 && cacheRead <= 0 && output <= 0) return null;
+  return { input, cache_r: cacheRead, output };
+}
+
+function codexUsageFingerprint(u) {
+  return `${u.input}|${u.cache_r}|${u.output}`;
+}
+
+function codexUsageTotal(u) {
+  return Number(u.input || 0) + Number(u.cache_r || 0) + Number(u.output || 0);
+}
+
+function codexUsageDiff(cur, prev) {
+  return {
+    input: Math.max(0, Number(cur.input || 0) - Number(prev.input || 0)),
+    cache_r: Math.max(0, Number(cur.cache_r || 0) - Number(prev.cache_r || 0)),
+    output: Math.max(0, Number(cur.output || 0) - Number(prev.output || 0)),
+  };
+}
+
+function isMonotonicCodexUsage(cur, prev) {
+  return Number(cur.input || 0) >= Number(prev.input || 0)
+    && Number(cur.cache_r || 0) >= Number(prev.cache_r || 0)
+    && Number(cur.output || 0) >= Number(prev.output || 0);
+}
+
+function computeCodexTokenDelta(info, state, opts = {}) {
+  const total = normalizeCodexUsage(info && info.total_token_usage);
+  const last = normalizeCodexUsage(info && info.last_token_usage);
+  state.seenTotals = state.seenTotals || new Set();
+  state.seenLast = state.seenLast || new Set();
+
+  if (total) {
+    const fp = codexUsageFingerprint(total);
+    if (state.seenTotals.has(fp)) return null;
+    const prev = state.total;
+    const fileChanged = Boolean(prev && opts.file && state.file && state.file !== opts.file);
+
+    let delta;
+    let countMessage = true;
+    if (prev && isMonotonicCodexUsage(total, prev)) {
+      delta = codexUsageDiff(total, prev);
+      // 流式刷新时通常只增长 output；这不是新 API 调用。
+      countMessage = delta.input > 0 || delta.cache_r > 0;
+    } else if (fileChanged) {
+      // 同一 session 同时存在 sessions / archived_sessions 或 resume 子文件时，
+      // 后扫到的旧/子集文件可能从较低 total 开始。不要把它当 compaction 新段重复入账。
+      return null;
+    } else {
+      // 新 session / compaction reset / 断点续扫：last 是当前这轮请求的增量。
+      delta = last || total;
+      countMessage = true;
+    }
+    state.total = total;
+    if (opts.file) state.file = opts.file;
+    state.seenTotals.add(fp);
+    return codexUsageTotal(delta) > 0 ? { ...delta, countMessage } : null;
+  }
+
+  // 旧格式或异常行没有 total_token_usage 时，退回 last_token_usage，但至少去掉
+  // 跨文件重复快照，避免同一轮结果被重复累计。
+  if (last) {
+    const fp = codexUsageFingerprint(last);
+    if (state.seenLast.has(fp)) return null;
+    state.seenLast.add(fp);
+    return { ...last, countMessage: true };
+  }
+  return null;
 }
 
 async function aggregateCodex(targetDays, roots, deadlineMs) {
   const targetSet = new Set(targetDays);
   const cutoffMs = Date.now() - (WINDOW_DAYS + 2) * 86400 * 1000;
   const buckets = new Map();
-  for (const root of roots) {
-    for await (const file of walkCodexJsonl(root)) {
-      if (deadlineMs && Date.now() > deadlineMs) return [...buckets.values()];
-      let st;
-      try { st = await fs.promises.stat(file); } catch (_) { continue; }
-      if (st.mtimeMs < cutoffMs) continue;
-      let sessionId = sidFromCodexFilename(path.basename(file));
-      let cwd = "";
-      let currentModel = "";
-      const rl = readline.createInterface({ input: fs.createReadStream(file, "utf8"), crlfDelay: Infinity });
-      for await (const line of rl) {
-        if (!line) continue;
-        try {
-          const o = JSON.parse(line);
-          const ts = Date.parse(o.timestamp || "");
-          if (!Number.isFinite(ts)) continue;
-          if (o.type === "session_meta" && o.payload) {
-            sessionId = o.payload.id || sessionId;
-            cwd = o.payload.cwd || cwd;
-            continue;
-          }
-          if (o.type === "turn_context") {
-            const m = o.payload?.model || o.model;
-            if (m) currentModel = String(m);
-            continue;
-          }
-          if (o.type !== "event_msg" || o.payload?.type !== "token_count") continue;
-          // codex 语义：input_tokens 含 cached_input_tokens、output_tokens 含 reasoning_output_tokens。
-          // 用 last_token_usage（本轮增量；首条 baseline 的 info 为空 → 跳过）逐事件累加，
-          // 不对 total_token_usage 做差分：对 compaction（total 会重置/跳变）免疫，也无需维护 prev。
-          const u = o.payload.info?.last_token_usage;
-          if (!u) continue;
-          const inputTotal = Number(u.input_tokens || 0);
-          const cacheRead = Number(u.cached_input_tokens || 0);
-          const turn = {
-            input: Math.max(0, inputTotal - cacheRead), // 非缓存新输入，对齐 OTel/CC（不把 cache 重复计进 input）
-            cache_r: cacheRead,
-            output: Number(u.output_tokens || 0),       // 已含 reasoning_output_tokens，不再另加
-          };
-          const day = shDayOf(ts);
-          if (!targetSet.has(day)) continue;
-          if (!sessionId) continue;
-          const model = currentModel || "unknown";
-          const key = `${day}|${sessionId}|${model}`;
-          let b = buckets.get(key);
-          if (!b) {
-            b = { day, session_id: sessionId, model, cwd, messages: 0, input: 0, output: 0, cache_r: 0, cache_w: 0, first_ts: ts, last_ts: ts };
-            buckets.set(key, b);
-          }
-          b.messages++;
-          b.input += turn.input;
-          b.output += turn.output;
-          b.cache_r += turn.cache_r;
-          // codex 无 cache_w 概念，保持 0
-          if (ts < b.first_ts) b.first_ts = ts;
-          if (ts > b.last_ts) b.last_ts = ts;
-          if (!b.cwd) b.cwd = cwd;
-        } catch (_) {}
-      }
+  const usageStateBySession = new Map();
+  const files = await collectCodexJsonl(roots);
+  for (const file of files) {
+    if (deadlineMs && Date.now() > deadlineMs) return [...buckets.values()];
+    let st;
+    try { st = await fs.promises.stat(file); } catch (_) { continue; }
+    if (st.mtimeMs < cutoffMs) continue;
+    let sessionId = sidFromCodexFilename(path.basename(file));
+    let cwd = "";
+    let currentModel = "";
+    const rl = readline.createInterface({ input: fs.createReadStream(file, "utf8"), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line) continue;
+      try {
+        const o = JSON.parse(line);
+        const ts = Date.parse(o.timestamp || "");
+        if (!Number.isFinite(ts)) continue;
+        if (o.type === "session_meta" && o.payload) {
+          sessionId = o.payload.id || sessionId;
+          cwd = o.payload.cwd || cwd;
+          continue;
+        }
+        if (o.type === "turn_context") {
+          const m = o.payload?.model || o.model;
+          if (m) currentModel = String(m);
+          continue;
+        }
+        if (o.type !== "event_msg" || o.payload?.type !== "token_count") continue;
+        if (!sessionId) continue;
+        let usageState = usageStateBySession.get(sessionId);
+        if (!usageState) {
+          usageState = {};
+          usageStateBySession.set(sessionId, usageState);
+        }
+        const turn = computeCodexTokenDelta(o.payload.info || {}, usageState, { file });
+        if (!turn) continue;
+        const day = shDayOf(ts);
+        if (!targetSet.has(day)) continue;
+        const model = currentModel || "unknown";
+        const key = `${day}|${sessionId}|${model}`;
+        let b = buckets.get(key);
+        if (!b) {
+          b = { day, session_id: sessionId, model, cwd, messages: 0, input: 0, output: 0, cache_r: 0, cache_w: 0, first_ts: ts, last_ts: ts };
+          buckets.set(key, b);
+        }
+        if (turn.countMessage) b.messages++;
+        b.input += turn.input;
+        b.output += turn.output;
+        b.cache_r += turn.cache_r;
+        // codex 无 cache_w 概念，保持 0
+        if (ts < b.first_ts) b.first_ts = ts;
+        if (ts > b.last_ts) b.last_ts = ts;
+        if (!b.cwd) b.cwd = cwd;
+      } catch (_) {}
     }
   }
   return [...buckets.values()];
@@ -446,7 +523,14 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
   return { ok: allOk, batches: batches.length, totalRolls: rolls.length, status: lastStatus, error: lastError };
 }
 
-(async () => {
+async function main() {
+  // Watchdog：scanner 卡在 readline / mysql 读时 60s 强退；保护用户机器。
+  const watchdog = setTimeout(() => {
+    logEvent("local_usage_watchdog_killed", {});
+    process.exit(1);
+  }, WATCHDOG_MS);
+  watchdog.unref();
+
   try {
     const installDir = __dirname;
     const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
@@ -593,4 +677,15 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
     logEvent("local_usage_error", { error: (e && e.message) || "unknown" });
     if (OPTS.manual) process.exit(1);
   }
-})();
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports.__test__ = {
+  aggregateCodex,
+  collectCodexJsonl,
+  computeCodexTokenDelta,
+  normalizeCodexUsage,
+};
