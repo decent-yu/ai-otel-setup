@@ -249,10 +249,25 @@ function codexUsageDiff(cur, prev) {
   };
 }
 
+function capCodexUsageDelta(delta, last) {
+  if (!last) return delta;
+  return {
+    input: Math.min(Number(delta.input || 0), Number(last.input || 0)),
+    cache_r: Math.min(Number(delta.cache_r || 0), Number(last.cache_r || 0)),
+    output: Math.min(Number(delta.output || 0), Number(last.output || 0)),
+  };
+}
+
 function isMonotonicCodexUsage(cur, prev) {
   return Number(cur.input || 0) >= Number(prev.input || 0)
     && Number(cur.cache_r || 0) >= Number(prev.cache_r || 0)
     && Number(cur.output || 0) >= Number(prev.output || 0);
+}
+
+function rememberCodexTotal(state, total, fp, file) {
+  state.total = total;
+  if (file) state.file = file;
+  state.seenTotals.add(fp);
 }
 
 function computeCodexTokenDelta(info, state, opts = {}) {
@@ -271,6 +286,13 @@ function computeCodexTokenDelta(info, state, opts = {}) {
     let countMessage = true;
     if (prev && isMonotonicCodexUsage(total, prev)) {
       delta = codexUsageDiff(total, prev);
+      // total_token_usage 是累计快照，只能用 last_token_usage 能确认的部分；
+      // 否则历史基线缺失/文件乱序时会把累计总量误当成本轮增量。
+      if (!last) {
+        rememberCodexTotal(state, total, fp, opts.file);
+        return null;
+      }
+      delta = capCodexUsageDelta(delta, last);
       // 流式刷新时通常只增长 output；这不是新 API 调用。
       countMessage = delta.input > 0 || delta.cache_r > 0;
     } else if (fileChanged) {
@@ -279,12 +301,14 @@ function computeCodexTokenDelta(info, state, opts = {}) {
       return null;
     } else {
       // 新 session / compaction reset / 断点续扫：last 是当前这轮请求的增量。
-      delta = last || total;
+      if (!last) {
+        rememberCodexTotal(state, total, fp, opts.file);
+        return null;
+      }
+      delta = last;
       countMessage = true;
     }
-    state.total = total;
-    if (opts.file) state.file = opts.file;
-    state.seenTotals.add(fp);
+    rememberCodexTotal(state, total, fp, opts.file);
     return codexUsageTotal(delta) > 0 ? { ...delta, countMessage } : null;
   }
 
