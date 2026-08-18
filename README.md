@@ -38,6 +38,28 @@ npx -y ai-otel-setup url=collector服务地址
 | `--http` / `http=1` | Claude Code 原生 OTel 使用 OTLP/HTTP。默认使用此模式，logs 指向 `/v1/logs`，metrics 指向 `/v1/metrics`。 |
 | `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC，作为 HTTP 上报异常时的 fallback。 |
 | `--no-full-upload` | 关闭全量数据上报旁路（raw body + git snapshot）。默认已开启全量上报。 |
+| `usage-multiplier=N` | 灰度倍率，默认 `1`（不改变现有行为）。见下方「灰度倍率开关」。 |
+
+## 灰度倍率开关
+
+灰度测试用的全局倍率：上报出口把 token 字段乘 N 之后再发，用来在小规模装机上模拟大流量，验证看板/服务端在放大量级下的表现。
+
+```bash
+# 装机时指定，写入 endpoint.json 长期生效
+npx -y ai-otel-setup url=collector服务地址 usage-multiplier=5
+
+# 临时验证一次，不用重装（环境变量优先级高于 endpoint.json）
+AI_OTEL_USAGE_MULTIPLIER=5 npx -y ai-otel-setup usage-backfill --dry-run
+```
+
+规则：
+
+- **默认 1**，不传就完全等同于改动前的行为。合法区间 `0 < N <= 1000`；非数字、`0`、负数、超上限一律回落 1 并打印警告，不会静默放大。
+- **只在上报出口生效**。本地聚合结果与 `local-usage-state.json`（含 `locked_days`）永远存原始值，关掉开关后历史数据不受污染。
+- **只作用于 4 个 token 字段**（`input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens`）。`messages` 是调用次数事实计数，不放大。
+- token 是整数，乘完按四舍五入收敛。
+- 上报体的 envelope 里带 `usage_multiplier`，服务端可以据此反解真实用量（原始值 = 上报值 ÷ `usage_multiplier`）。
+- raw body / git snapshot 链路逐字节原样上传（受 `content_sha256` 校验），**内容不改写**，只在上传 metadata 里声明同一个 `usage_multiplier`，保证两条链路口径一致。
 
 ## 安装后会做什么
 

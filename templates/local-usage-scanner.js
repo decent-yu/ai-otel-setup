@@ -11,6 +11,8 @@
  *   - 5 分钟同 machine_id 内只跑一次（防 SessionStart 高频触发）
  *   - 历史 6 天用 lock 文件跳过；今天总是重算并 upsert
  *   - 失败不冒泡：任何异常都不阻塞主 hook
+ *   - 灰度倍率只在 POST 出口生效（见 resolveUsageMultiplier）：本地聚合与
+ *     local-usage-state.json 的 locked_days 永远存原始值，关掉开关后历史不受污染
  */
 
 "use strict";
@@ -454,6 +456,52 @@ function readUploadToken(installDir) {
   try { return fs.readFileSync(path.join(installDir, "raw-upload-token"), "utf8").trim(); } catch (_) { return ""; }
 }
 
+// ===== 灰度倍率 =====
+// 全局倍率开关，只用于灰度压测：上报出口把 token 字段乘一个系数，本地聚合与
+// locked_days 状态保持原始值。
+// 来源优先级：env AI_OTEL_USAGE_MULTIPLIER（临时验证）→ endpoint.json 的
+// usageMultiplier（installer 写盘）→ 1。
+// 合法区间 (0, MAX_USAGE_MULTIPLIER]；非数字 / <=0 / 超上限 / 缺省一律回落 1，
+// 即默认完全不改变现有行为。
+const DEFAULT_USAGE_MULTIPLIER = 1;
+const MAX_USAGE_MULTIPLIER = 1000;
+
+function normalizeUsageMultiplier(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_USAGE_MULTIPLIER) return null;
+  return n;
+}
+
+function resolveUsageMultiplier(cfg, env) {
+  const source = env || {};
+  const fromEnv = normalizeUsageMultiplier(source.AI_OTEL_USAGE_MULTIPLIER);
+  if (fromEnv !== null) return fromEnv;
+  const fromCfg = normalizeUsageMultiplier(cfg && cfg.usageMultiplier);
+  if (fromCfg !== null) return fromCfg;
+  return DEFAULT_USAGE_MULTIPLIER;
+}
+
+// 倍率只作用于 4 个 token 字段，不动 messages（调用次数是事实计数，放大后无法解释）。
+// token 是整数：乘完统一 Math.round 四舍五入收敛，负数不可能出现但仍夹到 >= 0。
+const MULTIPLIED_TOKEN_FIELDS = ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"];
+
+function scaleTokenValue(value, multiplier) {
+  const n = Number(value) || 0;
+  return Math.max(0, Math.round(n * multiplier));
+}
+
+function applyUsageMultiplier(rolls, multiplier) {
+  if (!(multiplier > 0) || multiplier === 1) return rolls;
+  return rolls.map((roll) => {
+    const scaled = { ...roll };
+    for (const field of MULTIPLIED_TOKEN_FIELDS) {
+      scaled[field] = scaleTokenValue(roll[field], multiplier);
+    }
+    return scaled;
+  });
+}
+
 // 数字紧凑显示：<1000 原值，K/M/B 三位有效数字
 function compactNum(n) {
   if (!Number.isFinite(n)) return "0";
@@ -522,12 +570,14 @@ function printDailyTable(window, ccBuckets, codexBuckets) {
   process.stdout.write("\n");
 }
 
-/** rolls > MAX_ROLLS_PER_POST 时切批分发，所有批都 2xx 才认为成功 */
-async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeoutMs) {
+/** rolls > MAX_ROLLS_PER_POST 时切批分发，所有批都 2xx 才认为成功
+ *  倍率在这里乘：这是本文件唯一的 POST 出口，调用方传进来的 rolls 始终是原始值 */
+async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeoutMs, multiplier) {
   if (rolls.length === 0) return { ok: true, batches: 0, totalRolls: 0 };
+  const scaledRolls = applyUsageMultiplier(rolls, multiplier === undefined ? DEFAULT_USAGE_MULTIPLIER : multiplier);
   const batches = [];
-  for (let i = 0; i < rolls.length; i += MAX_ROLLS_PER_POST) {
-    batches.push(rolls.slice(i, i + MAX_ROLLS_PER_POST));
+  for (let i = 0; i < scaledRolls.length; i += MAX_ROLLS_PER_POST) {
+    batches.push(scaledRolls.slice(i, i + MAX_ROLLS_PER_POST));
   }
   let allOk = true;
   let lastStatus = 0;
@@ -596,6 +646,10 @@ async function main() {
     });
 
     const token = cfg.hasUploadToken ? readUploadToken(installDir) : "";
+    const usageMultiplier = resolveUsageMultiplier(cfg, process.env);
+    if (usageMultiplier !== DEFAULT_USAGE_MULTIPLIER) {
+      logEvent("local_usage_multiplier", { multiplier: usageMultiplier });
+    }
     const baseEnvelope = {
       machine_id: machineId,
       installer_version: cfg.installerVersion || "",
@@ -604,6 +658,8 @@ async function main() {
       mongo_gray: cfg.fullUpload === true ? "beta" : "",
       today_local: today,
       window_days: WINDOW_DAYS,
+      // 服务端靠这个字段反解真实用量（原始值 = 上报值 / usage_multiplier）
+      usage_multiplier: usageMultiplier,
     };
 
     function bucketsToRolls(buckets) {
@@ -629,10 +685,10 @@ async function main() {
     let ccOk = true; // 默认 ok（无 rolls 视为不需要发）
     if (ccRolls.length > 0) {
       if (OPTS.dryRun) {
-        logEvent("local_usage_dry_run", { source: "cc", rolls: ccRolls.length });
+        logEvent("local_usage_dry_run", { source: "cc", rolls: ccRolls.length, multiplier: usageMultiplier });
         ccOk = true;
       } else {
-        const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "cc", ccRolls, token, POST_TIMEOUT_MS);
+        const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "cc", ccRolls, token, POST_TIMEOUT_MS, usageMultiplier);
         ccOk = res.ok;
         if (ccOk) {
           logEvent("local_usage_post_ok", { source: "cc", batches: res.batches, rolls: res.totalRolls });
@@ -653,10 +709,10 @@ async function main() {
     let codexOk = true;
     if (codexRolls.length > 0) {
       if (OPTS.dryRun) {
-        logEvent("local_usage_dry_run", { source: "codex", rolls: codexRolls.length });
+        logEvent("local_usage_dry_run", { source: "codex", rolls: codexRolls.length, multiplier: usageMultiplier });
         codexOk = true;
       } else {
-        const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "codex", codexRolls, token, POST_TIMEOUT_MS);
+        const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "codex", codexRolls, token, POST_TIMEOUT_MS, usageMultiplier);
         codexOk = res.ok;
         if (codexOk) {
           logEvent("local_usage_post_ok", { source: "codex", batches: res.batches, rolls: res.totalRolls });
@@ -688,6 +744,7 @@ async function main() {
       const durationMs = Date.now() - startedAt;
       logEvent("local_usage_summary", {
         mode: OPTS.dryRun ? "dry-run" : "post",
+        multiplier: usageMultiplier,
         cc_rolls: ccRolls.length,
         codex_rolls: codexRolls.length,
         cc_status: ccOk ? "ok" : "fail",
@@ -709,7 +766,12 @@ if (require.main === module) {
 
 module.exports.__test__ = {
   aggregateCodex,
+  applyUsageMultiplier,
   collectCodexJsonl,
   computeCodexTokenDelta,
   normalizeCodexUsage,
+  normalizeUsageMultiplier,
+  resolveUsageMultiplier,
+  DEFAULT_USAGE_MULTIPLIER,
+  MAX_USAGE_MULTIPLIER,
 };

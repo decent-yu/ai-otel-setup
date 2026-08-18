@@ -125,7 +125,8 @@ total       4        3.6M       0           0             3.6M
 | `local_usage_post_fail` | POST 失败，含 HTTP 状态码和错误片段 |
 | `local_usage_dry_run` | `--dry-run` 时算完 buckets 跳过 POST |
 | `local_usage_skip` | 整体被 skip，看 `reason` 字段：`throttled` / `no_localUsageUrl` / `no_machine_id` |
-| `local_usage_summary` | manual 模式结束摘要，含 mode / rolls / status / duration |
+| `local_usage_multiplier` | 灰度倍率不为 1 时打一次，`multiplier` 是本次上报实际使用的倍率 |
+| `local_usage_summary` | manual 模式结束摘要，含 mode / multiplier / rolls / status / duration |
 | `local_usage_watchdog_killed` | 跑超过 10min 被强退（manual 模式 watchdog） |
 | `local_usage_error` | 异常退出，看 `error` 字段 |
 
@@ -141,6 +142,24 @@ total       4        3.6M       0           0             3.6M
 | 单次最长跑 | 默认 hook 模式 20s；manual 模式 5min | 超时直接返回当前已聚合的 buckets |
 | Watchdog | 默认 hook 模式 60s；manual 模式 10min | 强退兜底，防 readline / network 卡死 |
 | 数据源 | `~/.claude/projects/**/*.jsonl` + `~/.codex/sessions/**/*.jsonl` + `~/.codex/archived_sessions/**/*.jsonl` | Gemini 暂不参与 |
+| 灰度倍率 | 1（不放大） | 见下方「灰度倍率」 |
+
+---
+
+## 灰度倍率
+
+`usage-backfill` 会沿用装机时写入的灰度倍率。倍率**只在 POST 出口生效**：表里打印的按日聚合、以及 `local-usage-state.json` 的 `locked_days`，都是原始值。
+
+```bash
+# 临时用 5 倍跑一次 dry-run（不真发，也不写 lock）
+AI_OTEL_USAGE_MULTIPLIER=5 npx -y ai-otel-setup usage-backfill --dry-run
+```
+
+来源优先级：环境变量 `AI_OTEL_USAGE_MULTIPLIER` → `~/.claude/cc-otel/endpoint.json` 的 `usageMultiplier` → 1。合法区间 `0 < N <= 1000`，非法值回落 1。
+
+放大只作用于 4 个 token 字段（`input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens`），`messages` 保持原值；乘完按四舍五入收敛成整数。上报体 envelope 带 `usage_multiplier`，服务端可反解真实用量。
+
+完整说明见 [README 的「灰度倍率开关」](../README.md#灰度倍率开关)。
 | 聚合维度 | `(machine_id, source, day, session_id, model)` | 同一组合 upsert 到 MySQL `ai_assistant.local_usage_daily` |
 
 ---

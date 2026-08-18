@@ -190,6 +190,27 @@ function normalizeOptionalTag(raw) {
   return value;
 }
 
+// 全局灰度倍率：写进 endpoint.json，由 local-usage-scanner.js / raw-body-uploader.js
+// 在**上报出口**读取并乘到 token 字段上。本地聚合与 locked_days 状态存原始值。
+// 默认 1（完全不改变现有行为）；非数字 / <=0 / 超上限一律回落 1，不硬编码任何倍率。
+// 临时验证可用 env AI_OTEL_USAGE_MULTIPLIER 覆盖，无需重装。
+const DEFAULT_USAGE_MULTIPLIER = 1;
+const MAX_USAGE_MULTIPLIER = 1000;
+
+function resolveUsageMultiplier(raw) {
+  const value = String(raw === undefined || raw === null ? "" : raw).trim();
+  if (!value) return DEFAULT_USAGE_MULTIPLIER;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_USAGE_MULTIPLIER) {
+    console.warn(
+      `[ai-otel-setup] usage-multiplier=${JSON.stringify(value)} 非法（需为 0 < N <= ${MAX_USAGE_MULTIPLIER}），` +
+      `已回落默认值 ${DEFAULT_USAGE_MULTIPLIER}。`
+    );
+    return DEFAULT_USAGE_MULTIPLIER;
+  }
+  return n;
+}
+
 function deriveRawUploadHost(hostname) {
   const host = String(hostname || "").replace(/^\[|\]$/g, "");
   if (!host || isIpHost(host) || isLocalHost(host)) return host;
@@ -1293,7 +1314,7 @@ function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport
   ].join("\n");
 }
 
-function installCodex(home, endpoint, otelTransport, gitUser) {
+function installCodex(home, endpoint, otelTransport, gitUser, usageMultiplier = DEFAULT_USAGE_MULTIPLIER) {
   const codexDir = path.join(home, ".codex");
   if (!fs.existsSync(codexDir)) {
     return { tool: "codex", status: "skipped", reason: "未检测到 ~/.codex" };
@@ -1336,6 +1357,8 @@ function installCodex(home, endpoint, otelTransport, gitUser) {
     ...buildEndpointConfig(endpoint, otelTransport),
     machineId,
     localUsageUrl: deriveLocalUsageUrl(endpoint),
+    // scanner 从 codex 侧 spawn 时同样要能读到倍率，两处 endpoint.json 必须一致
+    usageMultiplier,
   });
   const otelHook = buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport, gitUser);
   // F1：信任库放回末尾（我方写入块之外），下次 strip 不会再误删；命令未变 → trusted_hash 仍匹配 → hook 持续受信。
@@ -1495,6 +1518,7 @@ async function main() {
   // 全量数据上报默认开启；需要临时关闭时显式传 --no-full-upload，并写盘给 auto-update 续传。
   const fullUploadOptOut = truthyFlag(args["no-full-upload"]);
   const fullUpload = !fullUploadOptOut;
+  const usageMultiplier = resolveUsageMultiplier(args["usage-multiplier"] || args.usagemultiplier);
   const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
   // rawUploadUrl 唯一来源：fullUpload；显式 --upload-url 仍可强制覆盖。
   // opt-out 用户不需要这个 URL，scanner/raw-body-uploader 都不会跑。
@@ -1603,6 +1627,8 @@ async function main() {
       // local-usage-scanner.js 读这个 URL 上报本地用量；从主 endpoint 独立派生
       // （与 rawUploadUrl 同 hostname，不受 fullUpload / upload-token 门控）
       localUsageUrl: deriveLocalUsageUrl(endpoint),
+      // 灰度倍率：scanner / raw-body-uploader 在上报出口读它，默认 1
+      usageMultiplier,
     })
   );
 
@@ -1623,7 +1649,7 @@ async function main() {
 
   const results = [];
   try {
-    results.push(installCodex(home, endpoint, otelTransport, gitUser));
+    results.push(installCodex(home, endpoint, otelTransport, gitUser, usageMultiplier));
   } catch (e) {
     results.push({ tool: "codex", status: "failed", reason: e.message });
   }
@@ -1645,6 +1671,12 @@ async function main() {
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
+  // 倍率非默认值时无条件提示：这会放大看板数字，不能只在 debug 里说
+  if (usageMultiplier !== DEFAULT_USAGE_MULTIPLIER) {
+    console.log("");
+    console.log(`[ai-otel-setup] 注意：本次装机启用了灰度倍率 ${usageMultiplier}，上报的 token 会被放大 ${usageMultiplier} 倍。`);
+    console.log("  本地聚合与历史 lock 仍存原始值；恢复真实上报请重装并去掉 usage-multiplier。");
+  }
   if (debug) {
     console.log(`  ${"raw bodies".padEnd(12)}: ${rawBodiesDir}`);
     console.log(`  ${"raw upload".padEnd(12)}: ${rawUploadUrl ? "enabled" : "disabled"}`);
@@ -1655,6 +1687,7 @@ async function main() {
     if (fullUpload) console.log(`  ${"mode".padEnd(12)}: full upload`);
     else console.log(`  ${"mode".padEnd(12)}: full upload disabled`);
     console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
+    console.log(`  ${"usage mult".padEnd(12)}: ${usageMultiplier}${usageMultiplier === DEFAULT_USAGE_MULTIPLIER ? " (default)" : " (灰度放大)"}`);
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
     if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);
@@ -1710,6 +1743,9 @@ function printUsage() {
   --no-full-upload   关闭全量数据上报旁路（raw body + git snapshot）
   upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；不传会按 url 自动推导 raw-upload 域名
   upload-token=TOKEN raw body 上传 Bearer token（可选；仅服务端开启鉴权时需要，传入时写入本地 0600 token 文件）
+  usage-multiplier=N 灰度倍率（默认 1；0 < N <= ${MAX_USAGE_MULTIPLIER}）。上报出口把 token 字段乘 N，
+                     本地聚合与历史 lock 仍存原始值；非法值回落 1。
+                     临时验证也可用环境变量 AI_OTEL_USAGE_MULTIPLIER 覆盖，无需重装。
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }

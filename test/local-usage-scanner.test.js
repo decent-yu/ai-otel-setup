@@ -160,6 +160,98 @@ test("aggregateCodex: total 快照异常跳涨时只上报 last 能确认的用�
   assert.equal(rows[0].output, 1_000_010);
 });
 
+// ===== 灰度倍率 =====
+
+function roll(overrides) {
+  return {
+    day: "2026-08-18",
+    session_id: "sid-1",
+    model: "claude-opus-5",
+    workspace_name: "ai-otel-setup",
+    git_remote: "",
+    messages: 7,
+    input_tokens: 1000,
+    output_tokens: 200,
+    cache_read_tokens: 3000,
+    cache_creation_tokens: 40,
+    first_msg_ts: "2026-08-18T00:00:00.000Z",
+    last_msg_ts: "2026-08-18T01:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("resolveUsageMultiplier: 缺省回落 1，不改变现有行为", () => {
+  assert.equal(scanner.resolveUsageMultiplier({}, {}), 1);
+  assert.equal(scanner.resolveUsageMultiplier(null, null), 1);
+  assert.equal(scanner.resolveUsageMultiplier({ usageMultiplier: 1 }, {}), 1);
+  assert.equal(scanner.DEFAULT_USAGE_MULTIPLIER, 1);
+});
+
+test("resolveUsageMultiplier: endpoint.json 生效，env 优先级更高", () => {
+  assert.equal(scanner.resolveUsageMultiplier({ usageMultiplier: 5 }, {}), 5);
+  assert.equal(scanner.resolveUsageMultiplier({ usageMultiplier: 5 }, { AI_OTEL_USAGE_MULTIPLIER: "12" }), 12);
+  assert.equal(scanner.resolveUsageMultiplier({}, { AI_OTEL_USAGE_MULTIPLIER: "2.5" }), 2.5);
+  // env 非法时不吃掉 cfg 的合法值
+  assert.equal(scanner.resolveUsageMultiplier({ usageMultiplier: 5 }, { AI_OTEL_USAGE_MULTIPLIER: "abc" }), 5);
+});
+
+test("resolveUsageMultiplier: 非法值一律回落 1", () => {
+  for (const bad of ["", "abc", "0", "-3", "NaN", "Infinity", null, undefined, {}, String(scanner.MAX_USAGE_MULTIPLIER + 1)]) {
+    assert.equal(scanner.normalizeUsageMultiplier(bad), null, `normalize ${JSON.stringify(bad)}`);
+    assert.equal(scanner.resolveUsageMultiplier({ usageMultiplier: bad }, {}), 1, `cfg ${JSON.stringify(bad)}`);
+    assert.equal(scanner.resolveUsageMultiplier({}, { AI_OTEL_USAGE_MULTIPLIER: bad }), 1, `env ${JSON.stringify(bad)}`);
+  }
+  assert.equal(scanner.resolveUsageMultiplier({ usageMultiplier: scanner.MAX_USAGE_MULTIPLIER }, {}), scanner.MAX_USAGE_MULTIPLIER);
+});
+
+test("applyUsageMultiplier: 倍率 1 时逐字段不变，且不复制对象", () => {
+  const rolls = [roll()];
+  assert.equal(scanner.applyUsageMultiplier(rolls, 1), rolls);
+  assert.deepEqual(scanner.applyUsageMultiplier(rolls, 1), rolls);
+});
+
+test("applyUsageMultiplier: 只放大 4 个 token 字段，messages 与维度字段不动", () => {
+  const original = roll();
+  const [scaled] = scanner.applyUsageMultiplier([original], 3);
+
+  assert.equal(scaled.input_tokens, 3000);
+  assert.equal(scaled.output_tokens, 600);
+  assert.equal(scaled.cache_read_tokens, 9000);
+  assert.equal(scaled.cache_creation_tokens, 120);
+  // messages 是调用次数事实计数，放大后无法解释，必须保持原值
+  assert.equal(scaled.messages, 7);
+  assert.equal(scaled.day, original.day);
+  assert.equal(scaled.session_id, original.session_id);
+  assert.equal(scaled.model, original.model);
+  assert.equal(scaled.workspace_name, original.workspace_name);
+  assert.equal(scaled.first_msg_ts, original.first_msg_ts);
+  assert.equal(scaled.last_msg_ts, original.last_msg_ts);
+  // 入参不被就地改写：本地聚合结果仍是原始值
+  assert.equal(original.input_tokens, 1000);
+});
+
+test("applyUsageMultiplier: 小数倍率四舍五入成整数，结果不为负", () => {
+  const [scaled] = scanner.applyUsageMultiplier([
+    roll({ input_tokens: 3, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 1 }),
+  ], 1.5);
+
+  assert.equal(scaled.input_tokens, 5);   // 4.5 → 5
+  assert.equal(scaled.output_tokens, 8);  // 7.5 → 8
+  assert.equal(scaled.cache_read_tokens, 0);
+  assert.equal(scaled.cache_creation_tokens, 2); // 1.5 → 2
+  for (const field of ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"]) {
+    assert.equal(Number.isInteger(scaled[field]), true, `${field} 必须是整数`);
+    assert.equal(scaled[field] >= 0, true, `${field} 不能为负`);
+  }
+});
+
+test("applyUsageMultiplier: 非法倍率不放大（防御式回落）", () => {
+  const rolls = [roll()];
+  for (const bad of [0, -1, NaN, undefined, null]) {
+    assert.deepEqual(scanner.applyUsageMultiplier(rolls, bad), rolls, `multiplier ${bad}`);
+  }
+});
+
 test("aggregateCodex: 重复 archived/session 快照不会生成 unknown model 重复 bucket", async () => {
   const root = mkdirTemp();
   const sessions = path.join(root, "sessions", "2026", "07", "19");

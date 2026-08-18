@@ -66,6 +66,33 @@ function cfgBytes(cfg, key, defaultVal) {
   return Number.isFinite(n) && n > 0 ? n : defaultVal;
 }
 
+// ===== 灰度倍率 =====
+// 与 local-usage-scanner.js 同一份来源与回落规则：env AI_OTEL_USAGE_MULTIPLIER →
+// endpoint.json 的 usageMultiplier → 1；非法/缺省一律回落 1。
+//
+// 注意：这条出口传的是**逐字节原样**的 raw API body / git bundle，内容受
+// content_sha256 校验，绝不能改写文件内容——所以这里只在 init metadata 里声明本机
+// 当前倍率，让服务端从 raw body 反解 token 时能与 local-usage 口径一致，
+// 不会把同一台机器的两条链路算成两种量级。
+const DEFAULT_USAGE_MULTIPLIER = 1;
+const MAX_USAGE_MULTIPLIER = 1000;
+
+function normalizeUsageMultiplier(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_USAGE_MULTIPLIER) return null;
+  return n;
+}
+
+function resolveUsageMultiplier(cfg, env) {
+  const source = env || {};
+  const fromEnv = normalizeUsageMultiplier(source.AI_OTEL_USAGE_MULTIPLIER);
+  if (fromEnv !== null) return fromEnv;
+  const fromCfg = normalizeUsageMultiplier(cfg && cfg.usageMultiplier);
+  if (fromCfg !== null) return fromCfg;
+  return DEFAULT_USAGE_MULTIPLIER;
+}
+
 function sha256Buffer(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
@@ -369,6 +396,8 @@ async function uploadFile(file, stat, cfg, token) {
     installer_version: cfg.installerVersion || cfg.version || "",
     hostname: os.hostname() || "",
     git_user_email: cfg.gitUserEmail || "",
+    // 声明本机灰度倍率；raw body 字节流本身不改写（见 resolveUsageMultiplier 注释）
+    usage_multiplier: resolveUsageMultiplier(cfg, process.env),
   };
 
   const init = await requestJson("POST", `${base}/init`, metadata, token, 10000);
@@ -752,15 +781,32 @@ async function run() {
       lastDiscardedFiles: discardedFiles,
       lastDiscardedBytes: discardedBytes,
     });
-    logEvent("raw_uploader_done", { uploadedFiles, uploadedBytes, failedFiles, discardedFiles, discardedBytes });
+    logEvent("raw_uploader_done", {
+      uploadedFiles,
+      uploadedBytes,
+      failedFiles,
+      discardedFiles,
+      discardedBytes,
+      multiplier: resolveUsageMultiplier(cfg, process.env),
+    });
   } finally {
     releaseLock(lockFd);
   }
 }
 
-run().catch((e) => {
-  logEvent("raw_uploader_failed", {
-    error: e && e.message ? e.message : "unknown",
+// 与 local-usage-scanner.js 一致：只有直接执行才跑，被 require 时仅导出（供测试）
+if (require.main === module) {
+  run().catch((e) => {
+    logEvent("raw_uploader_failed", {
+      error: e && e.message ? e.message : "unknown",
+    });
+    process.exit(1);
   });
-  process.exit(1);
-});
+}
+
+module.exports.__test__ = {
+  normalizeUsageMultiplier,
+  resolveUsageMultiplier,
+  DEFAULT_USAGE_MULTIPLIER,
+  MAX_USAGE_MULTIPLIER,
+};
