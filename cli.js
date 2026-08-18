@@ -1224,7 +1224,7 @@ function ensureFeaturesHooksTrue(text) {
   return text.trimEnd() + "\n\n[features]\nhooks = true\n";
 }
 
-function buildCodexOtelBlock(endpoint, otelTransport) {
+function buildCodexOtelBlock(endpoint, otelTransport, gitUser) {
   // exporter / trace_exporter / metrics_exporter 是 externally-tagged enum：
   //   - 写 scalar `exporter = "otlp-grpc"`：codex 解析为 unit variant，因为
   //     OtlpGrpc 是 struct variant（带 endpoint 等字段），报
@@ -1233,16 +1233,24 @@ function buildCodexOtelBlock(endpoint, otelTransport) {
   //   - 只写 table `[otel.exporter."otlp-grpc"]` / `[otel.exporter."otlp-http"]`：✓ codex 把它解析为
   //     OtlpGrpc { endpoint }，tag 来自 key 名。
   // 官方 sample 之所以能 `exporter = "none"`，是因为 None 本身就是 unit variant。
+  const gitEmail = String((gitUser && gitUser.email) || "").trim().toLowerCase();
+  const identityHeader = gitEmail
+    ? [`headers = { "x-ai-otel-git-email" = ${JSON.stringify(gitEmail)} }`]
+    : [];
+
   if (otelTransport !== "http") {
     return [
       '[otel.exporter."otlp-grpc"]',
       `endpoint = ${JSON.stringify(endpoint)}`,
+      ...identityHeader,
       "",
       '[otel.trace_exporter."otlp-grpc"]',
       `endpoint = ${JSON.stringify(endpoint)}`,
+      ...identityHeader,
       "",
       '[otel.metrics_exporter."otlp-grpc"]',
       `endpoint = ${JSON.stringify(endpoint)}`,
+      ...identityHeader,
     ];
   }
 
@@ -1251,18 +1259,21 @@ function buildCodexOtelBlock(endpoint, otelTransport) {
     '[otel.exporter."otlp-http"]',
     `endpoint = ${JSON.stringify(logsEndpoint)}`,
     'protocol = "binary"',
+    ...identityHeader,
     "",
     '[otel.trace_exporter."otlp-http"]',
     `endpoint = ${JSON.stringify(tracesEndpointFromLogs(logsEndpoint))}`,
     'protocol = "binary"',
+    ...identityHeader,
     "",
     '[otel.metrics_exporter."otlp-http"]',
     `endpoint = ${JSON.stringify(metricsEndpointFromLogs(logsEndpoint))}`,
     'protocol = "binary"',
+    ...identityHeader,
   ];
 }
 
-function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport) {
+function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport, gitUser) {
   // 不再包裹 BEGIN/END 注释标记：codex 重写 config.toml 时会丢注释、把 marker 抹掉，
   // 标记本就靠不住。改为纯内容键控——重跑时按 otel 命名空间 + hook 命令签名识别并清理。
   // [features].hooks = true 由 ensureFeaturesHooksTrue 写到用户块里，避免重复声明 [features]
@@ -1271,7 +1282,7 @@ function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport
     'environment = "prod"',
     "log_user_prompt = false",
     "",
-    ...buildCodexOtelBlock(endpoint, otelTransport),
+    ...buildCodexOtelBlock(endpoint, otelTransport, gitUser),
     "",
     "[[hooks.SessionStart]]",
     'matcher = "startup|resume"',
@@ -1282,7 +1293,7 @@ function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport
   ].join("\n");
 }
 
-function installCodex(home, endpoint, otelTransport) {
+function installCodex(home, endpoint, otelTransport, gitUser) {
   const codexDir = path.join(home, ".codex");
   if (!fs.existsSync(codexDir)) {
     return { tool: "codex", status: "skipped", reason: "未检测到 ~/.codex" };
@@ -1326,7 +1337,7 @@ function installCodex(home, endpoint, otelTransport) {
     machineId,
     localUsageUrl: deriveLocalUsageUrl(endpoint),
   });
-  const otelHook = buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport);
+  const otelHook = buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport, gitUser);
   // F1：信任库放回末尾（我方写入块之外），下次 strip 不会再误删；命令未变 → trusted_hash 仍匹配 → hook 持续受信。
   let merged = existing.trimEnd() + "\n\n" + otelHook + "\n";
   if (hooksState) merged += "\n" + hooksState + "\n";
@@ -1612,7 +1623,7 @@ async function main() {
 
   const results = [];
   try {
-    results.push(installCodex(home, endpoint, otelTransport));
+    results.push(installCodex(home, endpoint, otelTransport, gitUser));
   } catch (e) {
     results.push({ tool: "codex", status: "failed", reason: e.message });
   }
@@ -1703,7 +1714,13 @@ function printUsage() {
 `);
 }
 
-main().catch((e) => {
-  console.error("[ai-otel-setup] 失败：" + (e && e.message ? e.message : e));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((e) => {
+    console.error("[ai-otel-setup] 失败：" + (e && e.message ? e.message : e));
+    process.exit(1);
+  });
+}
+
+module.exports.__test__ = {
+  buildCodexOtelBlock,
+};
