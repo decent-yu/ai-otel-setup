@@ -463,6 +463,13 @@ function readUploadToken(installDir) {
 // usageMultiplier（installer 写盘）→ 1。
 // 合法区间 (0, MAX_USAGE_MULTIPLIER]；非数字 / <=0 / 超上限 / 缺省一律回落 1，
 // 即默认完全不改变现有行为。
+//
+// ⚠️ 这份解析逻辑共有三份副本，改这里必须同步改另两处：
+//   - cli.js 的 resolveUsageMultiplier（installer 侧，多做 trim + console.warn）
+//   - templates/raw-body-uploader.js 的 resolveUsageMultiplier
+// DEFAULT_USAGE_MULTIPLIER / MAX_USAGE_MULTIPLIER 两个区间常量必须完全一致。
+// 不抽公共模块的原因：本文件是被 fs.copyFileSync 成独立单文件装到用户机器上的，
+// 运行时同目录只有 logging.js，没有可 require 的共享模块。详见 cli.js 同名函数注释。
 const DEFAULT_USAGE_MULTIPLIER = 1;
 const MAX_USAGE_MULTIPLIER = 1000;
 
@@ -489,6 +496,22 @@ const MULTIPLIED_TOKEN_FIELDS = ["input_tokens", "output_tokens", "cache_read_to
 function scaleTokenValue(value, multiplier) {
   const n = Number(value) || 0;
   return Math.max(0, Math.round(n * multiplier));
+}
+
+// dry-run 不进 POST 出口（倍率就是在那里乘的），所以单独算一遍放大后的合计打进日志，
+// 否则用户按文档跑 dry-run 只能看到声明值、看不到放大效果，会误判"倍率没生效"。
+function sumScaledTokens(rolls, multiplier) {
+  const scaled = applyUsageMultiplier(rolls, multiplier);
+  const totals = { scaled_input: 0, scaled_output: 0, scaled_cache_read: 0, scaled_cache_creation: 0 };
+  for (const r of scaled) {
+    totals.scaled_input += Number(r.input_tokens) || 0;
+    totals.scaled_output += Number(r.output_tokens) || 0;
+    totals.scaled_cache_read += Number(r.cache_read_tokens) || 0;
+    totals.scaled_cache_creation += Number(r.cache_creation_tokens) || 0;
+  }
+  totals.scaled_total = totals.scaled_input + totals.scaled_output +
+    totals.scaled_cache_read + totals.scaled_cache_creation;
+  return totals;
 }
 
 function applyUsageMultiplier(rolls, multiplier) {
@@ -685,7 +708,12 @@ async function main() {
     let ccOk = true; // 默认 ok（无 rolls 视为不需要发）
     if (ccRolls.length > 0) {
       if (OPTS.dryRun) {
-        logEvent("local_usage_dry_run", { source: "cc", rolls: ccRolls.length, multiplier: usageMultiplier });
+        logEvent("local_usage_dry_run", {
+          source: "cc",
+          rolls: ccRolls.length,
+          multiplier: usageMultiplier,
+          ...sumScaledTokens(ccRolls, usageMultiplier),
+        });
         ccOk = true;
       } else {
         const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "cc", ccRolls, token, POST_TIMEOUT_MS, usageMultiplier);
@@ -709,7 +737,12 @@ async function main() {
     let codexOk = true;
     if (codexRolls.length > 0) {
       if (OPTS.dryRun) {
-        logEvent("local_usage_dry_run", { source: "codex", rolls: codexRolls.length, multiplier: usageMultiplier });
+        logEvent("local_usage_dry_run", {
+          source: "codex",
+          rolls: codexRolls.length,
+          multiplier: usageMultiplier,
+          ...sumScaledTokens(codexRolls, usageMultiplier),
+        });
         codexOk = true;
       } else {
         const res = await postRollsBatched(cfg.localUsageUrl, baseEnvelope, "codex", codexRolls, token, POST_TIMEOUT_MS, usageMultiplier);
@@ -772,6 +805,7 @@ module.exports.__test__ = {
   normalizeCodexUsage,
   normalizeUsageMultiplier,
   resolveUsageMultiplier,
+  sumScaledTokens,
   DEFAULT_USAGE_MULTIPLIER,
   MAX_USAGE_MULTIPLIER,
 };

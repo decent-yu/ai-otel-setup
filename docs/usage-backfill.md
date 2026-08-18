@@ -142,25 +142,31 @@ total       4        3.6M       0           0             3.6M
 | 单次最长跑 | 默认 hook 模式 20s；manual 模式 5min | 超时直接返回当前已聚合的 buckets |
 | Watchdog | 默认 hook 模式 60s；manual 模式 10min | 强退兜底，防 readline / network 卡死 |
 | 数据源 | `~/.claude/projects/**/*.jsonl` + `~/.codex/sessions/**/*.jsonl` + `~/.codex/archived_sessions/**/*.jsonl` | Gemini 暂不参与 |
+| 聚合维度 | `(machine_id, source, day, session_id, model)` | 同一组合 upsert 到 MySQL `ai_assistant.local_usage_daily` |
 | 灰度倍率 | 1（不放大） | 见下方「灰度倍率」 |
 
 ---
 
 ## 灰度倍率
 
-`usage-backfill` 会沿用装机时写入的灰度倍率。倍率**只在 POST 出口生效**：表里打印的按日聚合、以及 `local-usage-state.json` 的 `locked_days`，都是原始值。
-
-```bash
-# 临时用 5 倍跑一次 dry-run（不真发，也不写 lock）
-AI_OTEL_USAGE_MULTIPLIER=5 npx -y ai-otel-setup usage-backfill --dry-run
-```
+`usage-backfill` 会沿用装机时写入的灰度倍率。倍率**只在 POST 出口生效**：按日聚合表打印的数字、以及 `local-usage-state.json` 的 `locked_days`，都是原始值。
 
 来源优先级：环境变量 `AI_OTEL_USAGE_MULTIPLIER` → `~/.claude/cc-otel/endpoint.json` 的 `usageMultiplier` → 1。合法区间 `0 < N <= 1000`，非法值回落 1。
 
 放大只作用于 4 个 token 字段（`input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens`），`messages` 保持原值；乘完按四舍五入收敛成整数。上报体 envelope 带 `usage_multiplier`，服务端可反解真实用量。
 
+### 怎么确认倍率生效
+
+```bash
+# 看当前生效的倍率是多少（--dry-run 不发 POST，也不写 lock）
+AI_OTEL_USAGE_MULTIPLIER=5 npx -y ai-otel-setup usage-backfill --dry-run
+```
+
+这条命令的用途是**确认倍率被正确解析**：日志里 `local_usage_multiplier multiplier=5` 与 `local_usage_dry_run ... multiplier=5` 会显示生效值，同时 `scaled_*` 字段给出放大后的合计。
+
+注意 `--dry-run` 不会真的走 POST 出口，所以按日聚合表里仍然是**原始值**——这是有意的（表反映本地真实用量）。要看真正发出去的放大数字，需要跑一次不带 `--dry-run` 的真实上报，或在服务端侧核对 envelope 的 `usage_multiplier`。
+
 完整说明见 [README 的「灰度倍率开关」](../README.md#灰度倍率开关)。
-| 聚合维度 | `(machine_id, source, day, session_id, model)` | 同一组合 upsert 到 MySQL `ai_assistant.local_usage_daily` |
 
 ---
 

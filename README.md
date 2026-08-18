@@ -45,17 +45,19 @@ npx -y ai-otel-setup url=collector服务地址
 灰度测试用的全局倍率：上报出口把 token 字段乘 N 之后再发，用来在小规模装机上模拟大流量，验证看板/服务端在放大量级下的表现。
 
 ```bash
-# 装机时指定，写入 endpoint.json 长期生效
+# 装机时指定，写入 endpoint.json 长期生效（auto-update 升级时会自动续传）
 npx -y ai-otel-setup url=collector服务地址 usage-multiplier=5
 
-# 临时验证一次，不用重装（环境变量优先级高于 endpoint.json）
-AI_OTEL_USAGE_MULTIPLIER=5 npx -y ai-otel-setup usage-backfill --dry-run
+# 不重装、只给某次手动补报临时改倍率（环境变量优先级高于 endpoint.json）
+AI_OTEL_USAGE_MULTIPLIER=5 npx -y ai-otel-setup usage-backfill
 ```
 
 规则：
 
 - **默认 1**，不传就完全等同于改动前的行为。合法区间 `0 < N <= 1000`；非数字、`0`、负数、超上限一律回落 1 并打印警告，不会静默放大。
 - **只在上报出口生效**。本地聚合结果与 `local-usage-state.json`（含 `locked_days`）永远存原始值，关掉开关后历史数据不受污染。
+- **跨版本升级存活**。auto-update 会把倍率续传给新版本安装，不会在下次发版后静默变回真实量级。
+- 想确认倍率被正确解析，加 `--dry-run` 看日志里的 `multiplier` 与 `scaled_*` 字段。注意 `--dry-run` 不走 POST 出口，按日聚合表打印的仍是原始值（这是有意的），详见 [docs/usage-backfill.md](docs/usage-backfill.md#怎么确认倍率生效)。
 - **只作用于 4 个 token 字段**（`input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens`）。`messages` 是调用次数事实计数，不放大。
 - token 是整数，乘完按四舍五入收敛。
 - 上报体的 envelope 里带 `usage_multiplier`，服务端可以据此反解真实用量（原始值 = 上报值 ÷ `usage_multiplier`）。

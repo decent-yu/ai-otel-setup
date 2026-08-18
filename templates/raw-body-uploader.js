@@ -70,6 +70,13 @@ function cfgBytes(cfg, key, defaultVal) {
 // 与 local-usage-scanner.js 同一份来源与回落规则：env AI_OTEL_USAGE_MULTIPLIER →
 // endpoint.json 的 usageMultiplier → 1；非法/缺省一律回落 1。
 //
+// ⚠️ 这份解析逻辑共有三份副本，改这里必须同步改另两处：
+//   - cli.js 的 resolveUsageMultiplier（installer 侧，多做 trim + console.warn）
+//   - templates/local-usage-scanner.js 的 resolveUsageMultiplier
+// DEFAULT_USAGE_MULTIPLIER / MAX_USAGE_MULTIPLIER 两个区间常量必须完全一致。
+// 不抽公共模块的原因：本文件是被 fs.copyFileSync 成独立单文件装到用户机器上的，
+// 运行时同目录只有 logging.js，没有可 require 的共享模块。详见 cli.js 同名函数注释。
+//
 // 注意：这条出口传的是**逐字节原样**的 raw API body / git bundle，内容受
 // content_sha256 校验，绝不能改写文件内容——所以这里只在 init metadata 里声明本机
 // 当前倍率，让服务端从 raw body 反解 token 时能与 local-usage 口径一致，

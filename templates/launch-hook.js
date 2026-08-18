@@ -73,6 +73,27 @@ function runNpmToolSync(name, args, options) {
   });
 }
 
+// auto-update 是"重建装机参数再跑一遍 installer"，所以**任何需要跨升级存活的装机
+// 选项都必须在这里续传**——漏了就会被下一次安装按默认值覆写掉。
+// 已续传：otelTransport、fullUploadOptOut（见各自注释）、usageMultiplier。
+function buildInstallArgs(cfg, latestVersion, platform) {
+  const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
+  if (cfg.otelTransport === "http") installArgs.push("--http");
+  if (cfg.otelTransport === "grpc" && platform === "win32") installArgs.push("--grpc");
+  // 全量上报已默认开启。只有用户显式 --no-full-upload 时才续传关闭选择；
+  // 灰度期旧安装（fullUpload=false 但没有 fullUploadOptOut）升级后会自动进入全量。
+  if (cfg.fullUploadOptOut === true) installArgs.push("--no-full-upload");
+  // 灰度倍率续传：不传的话 cli.js 的 resolveUsageMultiplier 会拿到 undefined 回落 1，
+  // 把 endpoint.json 的 usageMultiplier 覆写成 1 —— 一台设了倍率的灰度机器会在下次
+  // 版本发布后静默变回真实量级。条件取"合法且非默认值"：既覆盖 >1 的放大，也覆盖
+  // 0 < N < 1 的缩小（cli.js 允许小数倍率），倍率正好是 1 时无需传。
+  const multiplier = Number(cfg.usageMultiplier);
+  if (Number.isFinite(multiplier) && multiplier > 0 && multiplier !== 1) {
+    installArgs.push(`usage-multiplier=${multiplier}`);
+  }
+  return installArgs;
+}
+
 function runAutoUpdate(installDir) {
   const statePath = path.join(installDir, "auto-update-state.json");
   const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
@@ -110,12 +131,7 @@ function runAutoUpdate(installDir) {
     }
 
     logEvent("auto_update_install_start", { currentVersion, latestVersion });
-    const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
-    if (cfg.otelTransport === "http") installArgs.push("--http");
-    if (cfg.otelTransport === "grpc" && process.platform === "win32") installArgs.push("--grpc");
-    // 全量上报已默认开启。只有用户显式 --no-full-upload 时才续传关闭选择；
-    // 灰度期旧安装（fullUpload=false 但没有 fullUploadOptOut）升级后会自动进入全量。
-    if (cfg.fullUploadOptOut === true) installArgs.push("--no-full-upload");
+    const installArgs = buildInstallArgs(cfg, latestVersion, process.platform);
     runNpmToolSync("npx", installArgs, {
       stdio: "ignore",
       timeout: 120000,
@@ -249,6 +265,13 @@ function settingsTelemetrySnapshot(installDir) {
     settingsHasOtlpMetricsEndpoint: !!env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
     settingsNoProxyHasCollector: host ? noProxy.split(",").map((s) => s.trim()).some((s) => s === host || s.startsWith(`${host}:`)) : false,
   };
+}
+
+// 被 require 时只导出（供测试），不跑 launcher 主流程。
+// 直接执行路径（installer 铺到用户机器上后由 hook command 调用）行为不变。
+if (require.main !== module) {
+  module.exports.__test__ = { buildInstallArgs, compareVersions, PACKAGE_NAME };
+  return;
 }
 
 if (process.argv[2] === "--auto-update") {

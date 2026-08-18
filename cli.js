@@ -194,6 +194,21 @@ function normalizeOptionalTag(raw) {
 // 在**上报出口**读取并乘到 token 字段上。本地聚合与 locked_days 状态存原始值。
 // 默认 1（完全不改变现有行为）；非数字 / <=0 / 超上限一律回落 1，不硬编码任何倍率。
 // 临时验证可用 env AI_OTEL_USAGE_MULTIPLIER 覆盖，无需重装。
+//
+// ⚠️ 这份解析逻辑共有三份副本，改这里必须同步改另两处：
+//   - templates/local-usage-scanner.js 的 resolveUsageMultiplier
+//   - templates/raw-body-uploader.js 的 resolveUsageMultiplier
+// 特别是 DEFAULT_USAGE_MULTIPLIER / MAX_USAGE_MULTIPLIER 两个区间常量必须完全一致，
+// 否则 installer 认为合法的值会被上报侧判为非法（或反之），出现"装了倍率但没生效"。
+// 为什么不抽公共模块：templates/ 下的脚本是被 fs.copyFileSync 成**独立单文件**装到
+// 用户机器上的（见 installLauncher / installCodex / installRawUploader），运行时目录里
+// 没有 node_modules 也没有相对路径可 require 的兄弟模块，只有 logging.js 是显式一起
+// 拷过去的。新增共享模块要改动三处安装逻辑与卸载清单，收益不抵风险，故保持复制。
+//
+// 本文件（installer）版与模板版的已知差异，均为有意：
+//   - 本文件先 String(raw).trim()：argv 来源可能带空白
+//   - 本文件非法时 console.warn：装机是交互场景，必须让用户看到回落
+//   模板版跑在后台 hook 里，无 stdout 可依赖，改为静默回落 + logEvent 记录。
 const DEFAULT_USAGE_MULTIPLIER = 1;
 const MAX_USAGE_MULTIPLIER = 1000;
 
