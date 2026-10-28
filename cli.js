@@ -25,6 +25,8 @@ const net = require("net");
 const crypto = require("crypto");
 const { execFileSync, spawn, spawnSync } = require("child_process");
 
+const { DEFAULTS: STORAGE_DEFAULTS } = require("./templates/spool-storage");
+
 const PKG_VERSION = require("./package.json").version;
 
 // 安装时这台机器的 node 绝对路径，POSIX 上拿来构造 hook command 用。
@@ -1335,6 +1337,7 @@ function installCodex(home, endpoint, otelTransport, gitUser, snapshotConfig = {
   const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
   fs.copyFileSync(path.join(__dirname, "templates", "git-snapshot.js"), gitSnapshotDest);
   fs.chmodSync(gitSnapshotDest, 0o755);
+  fs.copyFileSync(path.join(__dirname, "templates", "spool-storage.js"), path.join(installDir, "spool-storage.js"));
   const machineId = getOrCreateMachineId(installDir);
   writeInstallLog(installDir, "codex", endpoint, otelTransport);
   const bak = backup(configPath);
@@ -1366,6 +1369,8 @@ function installCodex(home, endpoint, otelTransport, gitUser, snapshotConfig = {
     installerVersion: PKG_VERSION,
     fullUpload: snapshotConfig.fullUpload === true,
     rawBodiesDir: snapshotConfig.rawBodiesDir || "",
+    rawUploaderDir: path.join(home, ".claude", "cc-otel", "raw-uploader"),
+    ...STORAGE_DEFAULTS,
     gitSnapshotMaxFiles: snapshotConfig.gitSnapshotMaxFiles || 20,
     gitSnapshotMaxBytes: snapshotConfig.gitSnapshotMaxBytes || 1 * 1024 * 1024,
     gitSnapshotPerFileBytes: snapshotConfig.gitSnapshotPerFileBytes || 256 * 1024,
@@ -1595,6 +1600,7 @@ async function main() {
   const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
   fs.copyFileSync(path.join(templateDir, "git-snapshot.js"), gitSnapshotDest);
   fs.chmodSync(gitSnapshotDest, 0o755);
+  fs.copyFileSync(path.join(__dirname, "templates", "spool-storage.js"), path.join(installDir, "spool-storage.js"));
   // local-usage-scanner.js：同样由 on-session-start.js spawn 出来的 detached 子进程
   const localUsageScannerDest = path.join(installDir, "local-usage-scanner.js");
   fs.copyFileSync(path.join(templateDir, "local-usage-scanner.js"), localUsageScannerDest);
@@ -1621,10 +1627,8 @@ async function main() {
       rawUploadUrl,
       rawUploadChunkBytes: 4 * 1024 * 1024,
       rawUploadMultipart: true,
-      rawBodiesSoftLimitBytes: 2 * 1024 * 1024 * 1024,
-      rawBodiesHardLimitBytes: 5 * 1024 * 1024 * 1024,
-      rawBodiesTargetLimitBytes: 2 * 1024 * 1024 * 1024,
-      rawBodiesMinFreeBytes: 2 * 1024 * 1024 * 1024,
+      ...STORAGE_DEFAULTS,
+      rawUploaderDir: path.join(installDir, "raw-uploader"),
       hasUploadToken: !!rawUploadToken,
       fullUpload,
       fullUploadOptOut,

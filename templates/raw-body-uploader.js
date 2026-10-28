@@ -7,6 +7,7 @@ const os = require("os");
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
+const storage = require("./spool-storage");
 
 let logEvent = () => {};
 try {
@@ -27,12 +28,6 @@ const DEFAULT_MAX_RUNTIME_MS = 25 * 1000;
 const DEFAULT_MAX_FILES = 50;
 const DEFAULT_MAX_BYTES = 200 * 1024 * 1024;
 const DEFAULT_STABLE_AGE_MS = 15 * 1000;
-const DEFAULT_SENT_RETENTION_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_RAW_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const DEFAULT_SOFT_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
-const DEFAULT_HARD_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
-const DEFAULT_TARGET_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
-const DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 const LOCK_STALE_MS = 30 * 60 * 1000;
 
 function readJSONSafe(file) {
@@ -59,11 +54,6 @@ function parseArgs(argv) {
     else if (arg.startsWith("--max-bytes=")) out.maxBytes = Number(arg.slice("--max-bytes=".length));
   }
   return out;
-}
-
-function cfgBytes(cfg, key, defaultVal) {
-  const n = Number(cfg && cfg[key]);
-  return Number.isFinite(n) && n > 0 ? n : defaultVal;
 }
 
 function sha256Buffer(buf) {
@@ -309,24 +299,6 @@ async function moveToSent(file) {
   return dest;
 }
 
-function discardedPathFor(file, reason) {
-  const d = new Date().toISOString().slice(0, 10);
-  const safeReason = String(reason || "disk_guard").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 60);
-  return path.join(UPLOADER_DIR, "discarded", d, safeReason, path.basename(file));
-}
-
-async function moveToDiscarded(file, reason) {
-  const dest = discardedPathFor(file, reason);
-  await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-  try {
-    await fs.promises.rename(file, dest);
-  } catch (_) {
-    await fs.promises.copyFile(file, dest);
-    await fs.promises.unlink(file);
-  }
-  return dest;
-}
-
 async function discardRawFile(file, reason) {
   await fs.promises.unlink(file);
   return "";
@@ -414,198 +386,52 @@ async function uploadFile(file, stat, cfg, token) {
   }
 
   const contentSha = hash.digest("hex");
-  await requestJson("POST", `${base}/${uploadId}/complete`, { content_sha256: contentSha }, token, 30000);
+  const completed = await requestJson("POST", `${base}/${uploadId}/complete`, { content_sha256: contentSha }, token, 30000);
+  if (completed.json.upload_status !== "completed" ||
+      (completed.json.content_sha256 && completed.json.content_sha256 !== contentSha)) {
+    throw new Error("raw upload complete not confirmed");
+  }
   return { sourceFileKey: key, contentSha256: contentSha, bytes: stat.size };
 }
 
-async function cleanupSent(now) {
-  const root = path.join(UPLOADER_DIR, "sent");
-  let dirs;
-  try {
-    dirs = await fs.promises.readdir(root, { withFileTypes: true });
-  } catch (_) {
-    return;
-  }
-  for (const dirent of dirs) {
-    if (!dirent.isDirectory()) continue;
-    const dir = path.join(root, dirent.name);
-    let files = [];
-    try {
-      files = await fs.promises.readdir(dir);
-    } catch (_) {
-      continue;
-    }
-    for (const name of files) {
-      const file = path.join(dir, name);
-      try {
-        const st = await fs.promises.stat(file);
-        if (now - st.mtimeMs > DEFAULT_SENT_RETENTION_MS) await fs.promises.unlink(file);
-      } catch (_) {}
-    }
-  }
-}
-
-async function cleanupDiscarded(now) {
-  const root = path.join(UPLOADER_DIR, "discarded");
-  let dateDirs;
-  try {
-    dateDirs = await fs.promises.readdir(root, { withFileTypes: true });
-  } catch (_) {
-    return;
-  }
-  for (const dateDir of dateDirs) {
-    if (!dateDir.isDirectory()) continue;
-    const datePath = path.join(root, dateDir.name);
-    let reasonDirs = [];
-    try {
-      reasonDirs = await fs.promises.readdir(datePath, { withFileTypes: true });
-    } catch (_) {
-      continue;
-    }
-    for (const reasonDir of reasonDirs) {
-      if (!reasonDir.isDirectory()) continue;
-      const dir = path.join(datePath, reasonDir.name);
-      let names = [];
-      try {
-        names = await fs.promises.readdir(dir);
-      } catch (_) {
-        continue;
-      }
-      const items = [];
-      for (const name of names) {
-        const file = path.join(dir, name);
-        try {
-          const st = await fs.promises.stat(file);
-          items.push({ file, mtimeMs: st.mtimeMs });
-        } catch (_) {}
-      }
-      items.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      for (let i = 0; i < items.length; i++) {
-        try {
-          if (now - items[i].mtimeMs > DEFAULT_SENT_RETENTION_MS) await fs.promises.unlink(items[i].file);
-        } catch (_) {}
-      }
-    }
-  }
-}
-
-async function rawDirInventory(dir) {
-  let total = 0;
-  const files = [];
-  for await (const file of walkRawFiles(dir)) {
-    try {
-      const st = await fs.promises.stat(file);
-      total += st.size;
-      files.push({ file, size: st.size, mtimeMs: st.mtimeMs });
-    } catch (_) {}
-  }
-  return { total, files };
-}
-
-async function freeBytesFor(dir) {
-  if (!fs.promises.statfs) return null;
-  try {
-    const st = await fs.promises.statfs(dir);
-    return Number(st.bavail) * Number(st.bsize);
-  } catch (_) {
-    return null;
-  }
-}
-
-async function applyDiskGuard(rawBodiesDir, cfg, state, phase) {
-  const softLimit = cfgBytes(cfg, "rawBodiesSoftLimitBytes", DEFAULT_SOFT_LIMIT_BYTES);
-  const hardLimit = cfgBytes(cfg, "rawBodiesHardLimitBytes", DEFAULT_HARD_LIMIT_BYTES);
-  const targetLimit = Math.min(cfgBytes(cfg, "rawBodiesTargetLimitBytes", DEFAULT_TARGET_LIMIT_BYTES), hardLimit);
-  const minFree = cfgBytes(cfg, "rawBodiesMinFreeBytes", DEFAULT_MIN_FREE_BYTES);
-  const inventory = await rawDirInventory(rawBodiesDir);
-  const freeBytes = await freeBytesFor(rawBodiesDir);
-  const lowFree = freeBytes !== null && freeBytes < minFree;
-
-  state.diskGuard = {
-    ...(state.diskGuard || {}),
-    lastCheckedAt: new Date().toISOString(),
-    rawBodiesBytes: inventory.total,
-    freeBytes: freeBytes === null ? "" : freeBytes,
-    softLimitBytes: softLimit,
-    hardLimitBytes: hardLimit,
-    targetLimitBytes: targetLimit,
-    minFreeBytes: minFree,
-  };
-
-  if (inventory.total > softLimit) {
-    logEvent("raw_uploader_soft_limit_exceeded", {
-      phase,
-      bytes: inventory.total,
-      freeBytes: freeBytes === null ? "" : freeBytes,
-      softLimitBytes: softLimit,
-    });
-  }
-
-  if (inventory.total <= hardLimit && !lowFree) {
-    return { rawBodiesBytes: inventory.total, discardedFiles: 0, discardedBytes: 0 };
-  }
-
-  inventory.files.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  let current = inventory.total;
+async function applyDiskGuard(rawBodiesDir, cfg, state, phase, options) {
+  const result = storage.maintain(rawBodiesDir, {...cfg, rawUploaderDir: UPLOADER_DIR}, options);
   let discardedFiles = 0;
   let discardedBytes = 0;
-  const reason = lowFree ? "low_free_space" : "raw_bodies_hard_limit";
-  const examples = [];
-
-  const stopAtBytes = lowFree ? 0 : targetLimit;
-  for (const item of inventory.files) {
-    if (current <= stopAtBytes) break;
-    const fileName = path.basename(item.file);
-    const key = sourceFileKey(cfg.machineId || "", item.file, { size: item.size, mtimeMs: item.mtimeMs });
-    try {
-      const dest = await discardRawFile(item.file, reason);
-      current -= item.size;
-      discardedFiles += 1;
-      discardedBytes += item.size;
+  for (const item of result.removed) {
+    if (item.kind === "raw" && storage.isRawFile(item.name)) {
+      const key = sourceFileKey(cfg.machineId || "", item.file, item);
       state.files[key] = {
-        ...(state.files[key] || {}),
-        uploaded: false,
-        discarded: true,
-        discardedAt: new Date().toISOString(),
-        discardReason: reason,
-        fileName,
-        bodyKind: fileBodyKind(fileName),
-        bytes: item.size,
+        ...state.files[key], uploaded: false, discarded: true,
+        discardedAt: new Date().toISOString(), discardReason: item.reason,
+        fileName: item.name, bodyKind: fileBodyKind(item.name), bytes: item.size,
         mtimeMs: Math.floor(item.mtimeMs),
-        discardedPath: dest,
       };
-      if (examples.length < 5) examples.push(`${fileName}:${item.size}`);
-    } catch (e) {
-      logEvent("raw_uploader_discard_failed", {
-        file: fileName,
-        bytes: item.size,
-        reason,
-        error: errorText(e),
-      });
+      discardedFiles++;
+      discardedBytes += item.size;
     }
+    logEvent("raw_uploader_file_cleaned", {file: item.name, bytes: item.size, reason: item.reason, phase});
   }
+  state.diskGuard = {
+    lastCheckedAt: new Date().toISOString(), rawBodiesBytes: result.total,
+    spoolBytes: result.total, freeBytes: result.freeBytes,
+    hardLimitBytes: result.limits.hard, softLimitBytes: result.limits.soft,
+    targetLimitBytes: result.limits.target, minFreeBytes: result.limits.minFree,
+    lastCleanedFiles: result.removed.length,
+  };
+  return {rawBodiesBytes: result.total, discardedFiles, discardedBytes};
+}
 
-  if (discardedFiles) {
-    state.diskGuard = {
-      ...(state.diskGuard || {}),
-      lastDiscardAt: new Date().toISOString(),
-      lastDiscardReason: reason,
-      lastDiscardedFiles: discardedFiles,
-      lastDiscardedBytes: discardedBytes,
-      rawBodiesBytesAfterDiscard: current,
-    };
-    logEvent("raw_uploader_disk_guard_discarded", {
-      phase,
-      reason,
-      discardedFiles,
-      discardedBytes,
-      rawBodiesBytesBefore: inventory.total,
-      rawBodiesBytesAfter: current,
-      examples: examples.join(","),
-    });
-  }
-
-  return { rawBodiesBytes: current, discardedFiles, discardedBytes };
+function pruneState(state, now = Date.now()) {
+  // Keep bounded recent receipts for ref retirement and diagnostics. Pending
+  // files whose state ages out can safely re-upload using deterministic IDs.
+  const entries = Object.entries(state.files || {}).filter(([, item]) => {
+    const time = Date.parse(item.uploadedAt || item.discardedAt || item.lastAttemptAt || "");
+    return !Number.isFinite(time) || now - time < 30 * storage.DAY;
+  });
+  entries.sort((a,b) => Date.parse(b[1].uploadedAt || b[1].discardedAt || b[1].lastAttemptAt || 0) -
+    Date.parse(a[1].uploadedAt || a[1].discardedAt || a[1].lastAttemptAt || 0));
+  state.files = Object.fromEntries(entries.slice(0, 5000));
 }
 
 async function run() {
@@ -629,13 +455,8 @@ async function run() {
     const cfg = readJSONSafe(ENDPOINT_FILE);
     const rawBodiesDir = cfg.rawBodiesDir || path.join(INSTALL_DIR, "raw-bodies");
     const token = readUploadToken();
-    if (!cfg.rawUploadUrl) {
-      logEvent("raw_uploader_skip", { reason: "missing_raw_upload_url" });
-      return;
-    }
-
     const state = readJSONSafe(STATE_FILE);
-    state.files = state.files || {};
+    pruneState(state);
     let uploadedFiles = 0;
     let uploadedBytes = 0;
     let failedFiles = 0;
@@ -645,7 +466,11 @@ async function run() {
     const preGuard = await applyDiskGuard(rawBodiesDir, cfg, state, "before_upload");
     discardedFiles += preGuard.discardedFiles;
     discardedBytes += preGuard.discardedBytes;
-    if (preGuard.discardedFiles) writeJSONAtomic(STATE_FILE, state);
+    writeJSONAtomic(STATE_FILE, state);
+    if (!cfg.rawUploadUrl) {
+      logEvent("raw_uploader_skip", {reason: "missing_raw_upload_url", cleaned: true});
+      return;
+    }
 
     for await (const file of walkRawFiles(rawBodiesDir)) {
       if (Date.now() - startedAt > maxRuntimeMs) break;
@@ -655,13 +480,6 @@ async function run() {
       if (!stat) continue;
       const fileName = path.basename(file);
       const bodyKind = fileBodyKind(fileName);
-      if (Date.now() - stat.mtimeMs > DEFAULT_RAW_RETENTION_MS && state.files[path.basename(file)]?.uploaded) {
-        try {
-          await fs.promises.unlink(file);
-        } catch (_) {}
-        continue;
-      }
-
       const key = sourceFileKey(cfg.machineId || "", file, stat);
       const item = state.files[key] || {};
       if (item.uploaded) {
@@ -744,11 +562,10 @@ async function run() {
       writeJSONAtomic(STATE_FILE, state);
     }
 
-    await cleanupSent(Date.now());
-    await cleanupDiscarded(Date.now());
     const postGuard = await applyDiskGuard(rawBodiesDir, cfg, state, "after_upload");
     discardedFiles += postGuard.discardedFiles;
     discardedBytes += postGuard.discardedBytes;
+    pruneState(state);
     writeJSONAtomic(STATE_FILE, {
       ...state,
       lastRunAt: new Date().toISOString(),
@@ -777,4 +594,6 @@ if (require.main === module) {
 module.exports.__test__ = {
   fileBodyKind,
   fileToolKind,
+  applyDiskGuard,
+  pruneState,
 };

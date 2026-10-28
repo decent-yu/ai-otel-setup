@@ -101,6 +101,10 @@ test("Codex install writes full snapshot config and shared snapshot engine", () 
   assert.equal(cfg.rawBodiesDir, rawBodiesDir);
   assert.equal(cfg.logsEndpoint, "http://127.0.0.1:4318/v1/logs");
   assert.ok(fs.existsSync(path.join(installDir, "git-snapshot.js")));
+  assert.ok(fs.existsSync(path.join(installDir, "spool-storage.js")));
+  assert.equal(cfg.rawBodiesHardLimitBytes, 512 * 1024 * 1024);
+  assert.equal(cfg.gitSnapshotBundleMaxBytes, 32 * 1024 * 1024);
+  assert.equal(cfg.rawUploaderDir, path.join(home, ".claude", "cc-otel", "raw-uploader"));
 
   const config = fs.readFileSync(path.join(codexDir, "config.toml"), "utf8");
   assert.equal((config.match(/\[\[hooks\.SessionStart\]\]/g) || []).length, 1);
