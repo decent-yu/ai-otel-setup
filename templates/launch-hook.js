@@ -178,13 +178,17 @@ function maybeSpawnAutoUpdate(nodeBin, installDir) {
 }
 
 function maybeSpawnRawUploader(nodeBin, installDir) {
-  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
-  if (!fs.existsSync(uploaderPath)) return;
-
   const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
-  if (!cfg.rawUploadUrl) return;
-
-  const statePath = path.join(installDir, "raw-uploader-trigger-state.json");
+  // Codex shares Claude's spool and uploader. It must also wake that uploader
+  // when the OS timer fails, rather than looking for a nonexistent local copy.
+  const ownerDir = cfg.rawUploaderDir ? path.dirname(cfg.rawUploaderDir) : installDir;
+  const uploaderPath = path.join(ownerDir, "raw-body-uploader.js");
+  if (!fs.existsSync(uploaderPath)) return;
+  const uploadCfg = readJSONSafe(path.join(ownerDir, "endpoint.json"));
+  if (!cfg.rawBodiesDir || !uploadCfg.rawBodiesDir ||
+      path.resolve(cfg.rawBodiesDir) !== path.resolve(uploadCfg.rawBodiesDir)) return;
+  // Cleanup runs even if rawUploadUrl is temporarily absent.
+  const statePath = path.join(ownerDir, "raw-uploader-trigger-state.json");
   const state = readJSONSafe(statePath);
   const now = Date.now();
   const lastAttemptAt = Number(state.lastAttemptAt || 0);

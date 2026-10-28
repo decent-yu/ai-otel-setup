@@ -15,7 +15,7 @@
  *
  * 关键约束：
  *   - detached 子进程，主 hook 不阻塞
- *   - 所有 git 命令各自带 timeout，总耗时上限约 15s
+ *   - 各 Git 步骤独立限时，bundle 导出有字节上限；失败不发布半成品
  *   - 节流已移除（2026-06）：每次 hook 触发都跑一次；delta diff 天然小，1MB 桶基本用不满
  *   - 三轴截断：max files / max bytes / per-file bytes
  *
@@ -32,12 +32,14 @@ const path = require("path");
 const os = require("os");
 const http = require("http");
 const https = require("https");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
+const crypto = require("crypto");
+const storage = require("./spool-storage");
 const { URL } = require("url");
 
 let logEvent = () => {};
 try {
-  ({ logEvent } = require("./logging.js"));
+  if (require.main === module) ({ logEvent } = require("./logging.js"));
 } catch (_) {
   // Logging 是 best effort。
 }
@@ -76,20 +78,42 @@ function safeGit(cwd, args, timeoutMs) {
   }
 }
 
-// 跟 safeGit 同款，但额外注入 GIT_INDEX_FILE，让 read-tree/add/write-tree 都用
-// 这个临时 index 文件，不碰用户的 .git/index
-function safeGitWithIndex(cwd, idxFile, args, timeoutMs) {
-  try {
-    return execFileSync("git", ["-C", cwd, ...args], {
-      env: { ...process.env, GIT_INDEX_FILE: idxFile },
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: timeoutMs,
-      maxBuffer: 32 * 1024 * 1024,
-      windowsHide: true,
-    }).toString();
-  } catch (_) {
-    return "";
+// Mutation steps must propagate failure: an add timeout cannot be mistaken for
+// a complete snapshot of the old read-tree baseline.
+function gitWithIndex(cwd, idxFile, args, timeoutMs, input) {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    env: {...process.env, GIT_INDEX_FILE: idxFile, GIT_LITERAL_PATHSPECS: "1"},
+    input, stdio: ["pipe", "pipe", "ignore"], timeout: timeoutMs,
+    maxBuffer: 1024 * 1024, windowsHide: true,
+  }).toString();
+}
+
+function snapshotError(reason) {
+  const error = new Error(reason);
+  error.reason = reason;
+  return error;
+}
+
+function preflight(cwd, head, cfg) {
+  const read = (args) => execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    timeout: 3000, maxBuffer: 1024 * 1024, windowsHide: true,
+  }).split("\0").filter(Boolean);
+  const tracked = head ? read(["diff", "--name-only", "--no-renames", "-z", head, "--"])
+    : read(["ls-files", "--cached", "-z"]);
+  const files = [...new Set([...tracked, ...read(["ls-files", "--others", "--exclude-standard", "-z"])])];
+  if (files.length > storage.positive(cfg, "gitSnapshotWorkspaceMaxFiles")) throw snapshotError("workspace_file_count_exceeded");
+  let total = 0;
+  for (const file of files) {
+    let st;
+    try { st = fs.lstatSync(path.join(cwd, file)); }
+    catch (e) { if (e.code === "ENOENT") continue; throw e; } // deletion
+    if (!st.isFile() && !st.isSymbolicLink()) continue; // submodule
+    if (st.size > storage.positive(cfg, "gitSnapshotFileMaxBytes")) throw snapshotError("workspace_file_too_large");
+    total += st.size;
+    if (total > storage.positive(cfg, "gitSnapshotWorkspaceMaxBytes")) throw snapshotError("workspace_bytes_exceeded");
   }
+  return files;
 }
 
 // 解析 `git diff --stat` 输出，提取每行对应的文件名（用于按顺序填 diff）
@@ -226,10 +250,10 @@ function listSnapshotsForSession(cwd, sessionId) {
 //   session_start → p_0
 //   user_prompt   → p_<已有 user_prompt 数 + 1>（新 prompt 开始）
 //   stop / 其它   → p_<已有 user_prompt 数>（继续当前 prompt，可能多次触发）
-// 状态全部从 git ref 现场扫，跨进程并发安全（git update-ref 原子）。
-function derivePromptId(existing, eventKind) {
+// 保留最后 commit 中的序号，避免过期 ref 回收后重复编号。
+function derivePromptId(existing, eventKind, previousSeq = 0) {
   if (eventKind === "session_start") return "p_0";
-  const promptCount = existing.filter((r) => r.kind === "user_prompt").length;
+  const promptCount = Math.max(previousSeq, existing.filter((r) => r.kind === "user_prompt").length);
   if (eventKind === "user_prompt") return `p_${promptCount + 1}`;
   return promptCount > 0 ? `p_${promptCount}` : "p_0";
 }
@@ -237,7 +261,7 @@ function derivePromptId(existing, eventKind) {
 // 落本帧 snapshot ref：临时 GIT_INDEX_FILE → read-tree HEAD → add -A →
 // write-tree → commit-tree → update-ref。全程不碰用户主 index/HEAD/branch。
 // 失败返回 null，主流程继续上报 OTLP（snapshot 字段留空）。
-function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
+function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId, head, files) {
   if (!sessionId) return null;
   const refname = `refs/snapshots/${sessionId}/${ts}-${eventKind}`;
   const idxFile = path.join(
@@ -246,23 +270,23 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
   );
 
   try {
-    // 先创建空文件占位，让 GIT_INDEX_FILE 指向有效路径（跨平台一致）
-    try { fs.writeFileSync(idxFile, ""); } catch (_) { return null; }
-
-    const hasHead = !!safeGit(cwd, ["rev-parse", "--verify", "HEAD"], 1000);
+    // Use the immutable HEAD recorded in this event, even if the user commits
+    // while the detached hook is running. read-tree creates its own index.
+    const hasHead = !!head;
 
     // 装载基线：有 HEAD 就以 HEAD 为基，否则从空 tree 起步（初始仓库）
     if (hasHead) {
-      safeGitWithIndex(cwd, idxFile, ["read-tree", "HEAD"], 3000);
+      gitWithIndex(cwd, idxFile, ["read-tree", head], 3000);
     } else {
-      safeGitWithIndex(cwd, idxFile, ["read-tree", "--empty"], 1000);
+      gitWithIndex(cwd, idxFile, ["read-tree", "--empty"], 1000);
     }
 
-    // 把整个工作区（含 untracked 非 ignore 文件）stage 进临时 index
-    // 注意：.gitignore 自动尊重；用户主 .git/index 完全不动
-    safeGitWithIndex(cwd, idxFile, ["add", "-A"], 10000);
+    // Only stage the preflighted paths, never a newly appeared large/untracked
+    // directory. NUL-delimited literal pathspecs handle spaces and metacharacters.
+    if (files.length) gitWithIndex(cwd, idxFile,
+      ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], 10000, files.join("\0") + "\0");
 
-    const tree = safeGitWithIndex(cwd, idxFile, ["write-tree"], 5000).trim();
+    const tree = gitWithIndex(cwd, idxFile, ["write-tree"], 5000).trim();
     if (!tree) return null;
 
     const message = [
@@ -273,7 +297,7 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
       `event_kind=${eventKind}`,
     ].join("\n");
 
-    const parentArgs = hasHead ? ["-p", "HEAD"] : [];
+    const parentArgs = hasHead ? ["-p", head] : [];
     let commit = "";
     try {
       commit = execFileSync("git", ["-C", cwd, "commit-tree", tree, ...parentArgs], {
@@ -298,39 +322,137 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
     return null;
   } finally {
     try { fs.unlinkSync(idxFile); } catch (_) {}
+    try { fs.unlinkSync(`${idxFile}.lock`); } catch (_) {}
   }
 }
 
-// 把当前帧 snapshot 打成 git bundle，落进 rawBodiesDir，让现有 raw-body-uploader 顺带传到 forward。
-// 增量(--not HEAD)：只含相对 HEAD 变化的对象，文件小；消费端凭 repo_url 取 HEAD 即可还原。
-// 无改动(snap 与 HEAD 同 tree)时 bundle 为空 → git 报错 → safeGit 吞掉 → 返回 ""（不传空文件）。
-// 返回落盘的文件名（= OTLP 事件里的连接键，清洗服务凭它把事件↔bundle↔OSS 路径对上）。
-function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRef, toolKind) {
-  if (!rawBodiesDir || !snapRef) return "";
+// Git writes to stdout, never directly to a disk .lock. Closing this pipe on
+// timeout/overflow also prevents a surviving pack-objects child growing a file.
+async function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRef, toolKind, head, cfg, spawnBundle = spawn) {
+  const safe = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "_");
+  const prefix = toolKind && toolKind !== "cc" ? `${safe(toolKind)}-` : "";
+  const fileName = `snapshot-${prefix}${safe(sessionId)}-${ts}-${safe(eventKind)}.snapshot.bundle`;
+  const output = path.join(rawBodiesDir, fileName);
+  const partial = path.join(rawBodiesDir, `.snapshot-${process.pid}-${crypto.randomBytes(12).toString("hex")}.partial`);
+  const maxBytes = storage.positive(cfg, "gitSnapshotBundleMaxBytes");
+  let fd;
+  let bytes = 0;
   try {
-    fs.mkdirSync(rawBodiesDir, { recursive: true });
-    const safe = (s) => String(s || "").replace(/[^A-Za-z0-9_.-]/g, "_");
-    // 保持 CC 既有文件名不变；Codex 显式加工具前缀，让共享 uploader 在不改
-    // spool 目录结构的前提下正确发送 tool_kind。
-    const toolPrefix = toolKind && toolKind !== "cc" ? `${safe(toolKind)}-` : "";
-    const fileName = `snapshot-${toolPrefix}${safe(sessionId)}-${ts}-${safe(eventKind)}.snapshot.bundle`;
-    const bundlePath = path.join(rawBodiesDir, fileName);
-    const hasHead = !!safeGit(cwd, ["rev-parse", "--verify", "HEAD"], 1000);
-    // git bundle 需要真实 ref 作 tip（不能用裸 commit SHA）；用 createSnapshotCommit 写的 snap ref。
-    const args = hasHead
-      ? ["bundle", "create", bundlePath, snapRef, "--not", "HEAD"]
-      : ["bundle", "create", bundlePath, snapRef];
-    safeGit(cwd, args, 10000);
-    let ok = false;
-    try { ok = fs.statSync(bundlePath).size > 0; } catch (_) { ok = false; }
-    if (!ok) { try { fs.unlinkSync(bundlePath); } catch (_) {} return ""; }
+    fd = fs.openSync(partial, "wx", 0o600);
+    await new Promise((resolve, reject) => {
+      const args = ["-C", cwd, "bundle", "create", "-", snapRef];
+      if (head) args.push("--not", head);
+      const child = spawnBundle("git", args, {stdio: ["ignore", "pipe", "pipe"], windowsHide: true});
+      let failure;
+      const abort = (error) => {
+        if (failure) return;
+        failure = error;
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.kill("SIGKILL");
+      };
+      const timer = setTimeout(() => abort(snapshotError("bundle_timeout")),
+        storage.positive(cfg, "gitSnapshotBundleTimeoutMs", 10000));
+      child.stdout.on("data", (chunk) => {
+        if (failure) return;
+        if (bytes + chunk.length > maxBytes) return abort(snapshotError("bundle_bytes_exceeded"));
+        try {
+          let offset = 0;
+          while (offset < chunk.length) offset += fs.writeSync(fd, chunk, offset, chunk.length - offset);
+          bytes += chunk.length;
+        } catch (e) { abort(e); }
+      });
+      child.stderr.resume();
+      child.stdout.on("error", abort);
+      child.stderr.on("error", abort);
+      child.on("error", error => { failure = error; });
+      child.on("close", code => {
+        clearTimeout(timer);
+        if (failure) reject(failure);
+        else if (code !== 0 || !bytes) reject(snapshotError("bundle_export_failed"));
+        else resolve();
+      });
+    });
+    fs.closeSync(fd); fd = undefined;
+    execFileSync("git", ["-C", cwd, "bundle", "verify", partial], {
+      stdio: "ignore", timeout: 5000, windowsHide: true,
+    });
+    if (!storage.canReserve(rawBodiesDir, cfg, 0)) throw snapshotError("spool_quota_exceeded");
+    fs.renameSync(partial, output);
     return fileName;
-  } catch (_) {
-    return "";
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.unlinkSync(partial); } catch (_) {}
   }
 }
 
-(async () => {
+function retireUploadedRefs(cwd, sessionId, rawDir, cfg, now) {
+  const refs = execFileSync("git", ["-C", cwd, "for-each-ref", "--format=%(refname) %(objectname)", "refs/snapshots/"],
+    {encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:3000,maxBuffer:1024*1024,windowsHide:true})
+    .trim().split(/\r?\n/).filter(Boolean);
+  const state = readJSONSafe(path.join(storage.uploaderDir(rawDir, cfg), "state.json"));
+  const uploaded = new Set(Object.values(state.files || {}).filter(item => item.uploaded).map(item => item.fileName));
+  const current = listSnapshotsForSession(cwd, sessionId);
+  const keep = current.length ? current[current.length - 1].refname : "";
+  const maxRefs = storage.positive(cfg, "gitSnapshotMaxRefs");
+  const parsed = refs.map(line => {
+    const [ref, commit] = line.split(" ");
+    const match = ref.match(/^refs\/snapshots\/([^/]+)\/(\d+)-(session_start|user_prompt|stop)$/);
+    return {ref, commit, match};
+  }).sort((a,b) => Number(a.match && a.match[2]) - Number(b.match && b.match[2]));
+  const latest = new Map();
+  for (const item of parsed) if (item.match) latest.set(item.match[1], item.ref);
+  let count = refs.length;
+  for (const {ref, commit, match} of parsed) {
+    if (!match || ref === keep) continue;
+    const expired = now - Number(match[2]) >= 7 * storage.DAY;
+    // Keep the last frame/sequence for every recent session. Under ref pressure
+    // older confirmed frames may retire early; their bundles are already remote.
+    if (!expired && (count < maxRefs || latest.get(match[1]) === ref)) continue;
+    const name = `snapshot-${match[1]}-${match[2]}-${match[3]}.snapshot.bundle`;
+    if (!uploaded.has(name) && !uploaded.has(name.replace("snapshot-", "snapshot-codex-"))) continue;
+    try {
+      execFileSync("git", ["-C", cwd, "update-ref", "-d", ref, commit], {stdio:"ignore",timeout:2000,windowsHide:true});
+      count--;
+    } catch (_) {} // Never retire an unconfirmed or concurrently changed ref.
+  }
+  return count;
+}
+
+async function captureSnapshot(cwd, sessionId, eventKind, ts, promptId, toolKind, head, cfg) {
+  const rawDir = cfg.rawBodiesDir;
+  if (!rawDir) return {status: "missing_raw_bodies_dir"};
+  const release = storage.acquireWriter(rawDir);
+  if (!release) return {status: "snapshot_writer_busy"};
+  let snap;
+  try {
+    // The producer only reclaims orphan/confirmed cached files here. Pending
+    // eviction is the uploader's responsibility so every discard is audited.
+    const cleaned = storage.maintain(rawDir, cfg, {evictPending: false});
+    if (cleaned.removed.length) logEvent("git_snapshot_spool_cleaned", {
+      files: cleaned.removed.length, bytes: cleaned.beforeBytes - cleaned.total,
+    });
+    const count = retireUploadedRefs(cwd, sessionId, rawDir, cfg, ts);
+    if (count >= storage.positive(cfg, "gitSnapshotMaxRefs")) throw snapshotError("snapshot_ref_limit");
+    if (!storage.canReserve(rawDir, cfg, storage.positive(cfg, "gitSnapshotBundleMaxBytes"))) {
+      throw snapshotError("spool_quota_exceeded");
+    }
+    const files = preflight(cwd, head, cfg);
+    snap = createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId, head, files);
+    if (!snap) throw snapshotError("snapshot_commit_failed");
+    const bundleFile = await writeSnapshotBundle(cwd, rawDir, sessionId, eventKind, ts, snap.refname, toolKind, head, cfg);
+    return {snap, bundleFile, status: "created"};
+  } catch (e) {
+    // Failed exports must not pin new blobs indefinitely via a hidden ref.
+    if (snap) safeGit(cwd, ["update-ref", "-d", snap.refname, snap.commit], 2000);
+    const status = e.reason || "snapshot_failed";
+    logEvent("git_snapshot_skipped", {reason: status});
+    return {status};
+  } finally { release(); }
+}
+
+async function run() {
+
   try {
     const args = parseArgs(process.argv.slice(2));
     const sessionId = args["session-id"] || "";
@@ -373,11 +495,16 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
     const existing = listSnapshotsForSession(cwd, sessionId);
     const parent = existing.length > 0 ? existing[existing.length - 1] : null;
     const isFirstFrame = !parent;
-    const promptId = derivePromptId(existing, eventKind);
+    // The last commit retains its sequence even after old uploaded refs expire.
+    const previousMessage = parent ? safeGit(cwd, ["show", "-s", "--format=%B", parent.commit], 1000) : "";
+    const previousSeq = Number((previousMessage.match(/^prompt_id=p_(\d+)$/m) || [])[1]) || 0;
+    const promptId = derivePromptId(existing, eventKind, previousSeq);
 
-    // -------- 落本帧 snapshot ref（本地，几乎免费） --------
+    // -------- 受配额与文件预算保护的快照生成 --------
     const ts = Date.now();
-    const snap = createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId);
+    const repoRoot = safeGit(cwd, ["rev-parse", "--show-toplevel"], 1000).trim();
+    const capture = await captureSnapshot(repoRoot, sessionId, eventKind, ts, promptId, toolKind, headCommit, cfg);
+    const snap = capture.snap;
 
     // -------- delta diff：本帧 vs 上一帧（首帧跳过，option C） --------
     let deltaStat = "";
@@ -403,13 +530,9 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
     const treeUnchanged = !!(snap && parentTree && parentTree === snap.tree);
 
     // 业务 workspace 字段 + 把当前帧 snapshot 打 git bundle 落进 rawBodiesDir（到这里必是 fullUpload，已在上面 gate）
-    const rawBodiesDir = cfg.rawBodiesDir || "";
-    const repoRoot = safeGit(cwd, ["rev-parse", "--show-toplevel"], 1000).trim();
     const repoUrl = safeGit(cwd, ["config", "--get", "remote.origin.url"], 1000).trim();
     const sourceLabel = (k) => (k === "user_prompt" ? "prompt_submit_hook" : "current_workspace");
-    const bundleFile = snap
-      ? writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snap.refname, toolKind)
-      : "";
+    const bundleFile = capture.bundleFile || "";
     // env_vars 全量（业务要求）；脱敏由后期清洗服务处理
     const envVars = JSON.stringify(Object.entries(process.env).map(([k, v]) => `${k}=${v}`));
 
@@ -458,6 +581,7 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
       "snapshot.repo_url": repoUrl || "",
       "snapshot.current_source": sourceLabel(eventKind),
       "snapshot.previous_source": parent ? sourceLabel(parent.kind) : "",
+      "snapshot.capture_status": capture.status,
       "snapshot.bundle_file": bundleFile || "",          // 连接键：对应上传到 OSS 的那个 bundle 文件
       "snapshot.os_info": `${os.type()} ${os.release()}`,
       "snapshot.cpu_arch": os.arch(),
@@ -509,4 +633,7 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
   } catch (e) {
     logEvent("git_snapshot_error", { error: (e && e.message) || "unknown" });
   }
-})();
+}
+
+if (require.main === module) run();
+module.exports.__test__ = {preflight, createSnapshotCommit, writeSnapshotBundle, captureSnapshot, retireUploadedRefs};

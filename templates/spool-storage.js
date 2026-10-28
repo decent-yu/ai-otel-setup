@@ -50,6 +50,8 @@ function uploaderDir(rawDir, cfg) {
 // Only traverse our explicit roots, and never follow a symlink out of the spool.
 function inventory(rawDir, cfg = {}) {
   const files = [];
+  const upload = path.resolve(uploaderDir(rawDir, cfg));
+  const rawRoot = path.resolve(rawDir);
   function walk(dir, kind) {
     let entries;
     try {
@@ -58,7 +60,14 @@ function inventory(rawDir, cfg = {}) {
     } catch (e) { if (e.code === "ENOENT") return; throw e; }
     for (const entry of entries) {
       const file = path.join(dir, entry.name);
-      if (entry.isDirectory()) { walk(file, kind); continue; }
+      if (entry.isDirectory()) {
+        const full = path.resolve(file);
+        if (kind === "metadata" && full === rawRoot) continue;
+        const next = full === upload ? "metadata" : full === path.join(upload,"sent") ? "sent" :
+          full === path.join(upload,"discarded") ? "discarded" : kind;
+        walk(file, next);
+        continue;
+      }
       if (!entry.isFile()) continue;
       try {
         const st = fs.lstatSync(file);
@@ -68,23 +77,9 @@ function inventory(rawDir, cfg = {}) {
     }
   }
   walk(rawDir, "raw");
-  const upload = uploaderDir(rawDir, cfg);
-  // sent/discarded must not also be inside rawDir (custom endpoint configs).
-  const insideRaw = (file) => {
-    const relative = path.relative(path.resolve(rawDir), path.resolve(file));
-    return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-  };
-  for (const kind of ["sent", "discarded"]) {
-    const dir = path.join(upload, kind);
-    if (!insideRaw(dir)) walk(dir, kind);
-  }
-  const state = path.join(upload, "state.json");
-  if (!insideRaw(state)) {
-    try {
-      const st = fs.lstatSync(state);
-      if (st.isFile()) files.push({file: state, name: "state.json", kind: "state", size: st.size, mtimeMs: st.mtimeMs});
-    } catch (e) { if (e.code !== "ENOENT") throw e; }
-  }
+  const relative = path.relative(rawRoot, upload);
+  const insideRaw = relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+  if (!insideRaw) walk(upload, "metadata");
   return { files, total: files.reduce((sum, item) => sum + item.size, 0) };
 }
 
@@ -124,6 +119,8 @@ function acquireWriter(rawDir) {
 }
 
 function temporary(item, now) {
+  const stateWrite = item.kind === "metadata" && item.name.match(/^state\.json\.tmp\.(\d+)$/);
+  if (stateWrite) return !alive(Number(stateWrite[1]));
   if (item.kind !== "raw") return false;
   const owned = item.name.match(/^\.snapshot-(\d+)-[a-f0-9]+\.partial$/);
   if (owned) return !alive(Number(owned[1]));
@@ -168,7 +165,7 @@ function maintain(rawDir, cfg = {}, options = {}) {
       remove(item, "orphan_snapshot");
     } else if ((item.kind === "sent" || item.kind === "discarded") && now - item.mtimeMs > DAY) {
       remove(item, "retention_expired");
-    } else if (item.kind === "raw" && isRawFile(item.name) && now - item.mtimeMs > 7 * DAY) {
+    } else if (options.evictPending !== false && item.kind === "raw" && isRawFile(item.name) && now - item.mtimeMs > 7 * DAY) {
       remove(item, "pending_retention_expired");
     }
   }
@@ -185,7 +182,7 @@ function maintain(rawDir, cfg = {}, options = {}) {
   }
   // Pressure eviction is best effort, as before, but never delete a current
   // writer's output and stop as soon as both quota and free space recover.
-  if (total > bound.hard || low()) {
+  if (options.evictPending !== false && (total > bound.hard || low())) {
     for (const item of ordered) {
       if (total <= bound.target && !low()) break;
       if (removedPaths.has(item.file) || oldTemporary.has(item.file)) continue;

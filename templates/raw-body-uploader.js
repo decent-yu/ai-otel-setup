@@ -364,6 +364,7 @@ async function uploadFile(file, stat, cfg, token) {
       const size = Math.min(chunkSize, stat.size - offset);
       const buffer = Buffer.allocUnsafe(size);
       const { bytesRead } = await fd.read(buffer, 0, size, offset);
+      if (!bytesRead) throw new Error("raw upload source changed during read");
       const chunk = bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead);
       hash.update(chunk);
       const chunkSha = sha256Buffer(chunk);

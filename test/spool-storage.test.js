@@ -139,3 +139,26 @@ test("uploader state has bounded history and retains recent upload receipts", ()
   assert.equal(state.files.expired, undefined);
   assert.equal(state.files[0].uploaded, true);
 });
+
+test("counts uploader metadata and cleans dead atomic-state writes without deleting unknown metadata", t => {
+  const f = fixture(t);
+  const dead = f.file("raw-uploader/state.json.tmp.2147483647", 30);
+  const live = f.file(`raw-uploader/state.json.tmp.${process.pid}`, 20);
+  const unknown = f.file("raw-uploader/unknown.data", 10);
+  assert.equal(storage.inventory(f.raw).total,60);
+  const result = storage.maintain(f.raw,quota,{freeBytes:()=>100000});
+  assert.equal(result.total,30);
+  assert.equal(fs.existsSync(dead),false);
+  assert(fs.existsSync(live)); assert(fs.existsSync(unknown));
+});
+
+test("overlapping custom spool roots are counted once and sent files remain reclaimable", t => {
+  const f = fixture(t);
+  f.file("raw-bodies/p.request.json",30);
+  const sent = f.file("raw-bodies/uploader/sent/day/s.request.json",60);
+  const cfg = {...quota,rawUploaderDir:path.join(f.raw,"uploader")};
+  assert.equal(storage.inventory(f.raw,cfg).total,90);
+  storage.maintain(f.raw,cfg,{freeBytes:()=>100000});
+  assert.equal(fs.existsSync(sent),false);
+  assert.equal(storage.inventory(f.raw,cfg).total,30);
+});

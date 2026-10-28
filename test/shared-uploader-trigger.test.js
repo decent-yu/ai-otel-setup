@@ -1,0 +1,35 @@
+"use strict";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const {spawnSync} = require("child_process");
+
+test("Codex hook wakes the shared uploader without an upload URL and shares its throttle", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(),"ai-otel-trigger-"));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const codex = path.join(root,"codex");
+  const claude = path.join(root,"claude");
+  const raw = path.join(claude,"raw-bodies");
+  fs.mkdirSync(codex); fs.mkdirSync(raw,{recursive:true});
+  const launcher = path.join(codex,"launch-hook.js");
+  fs.copyFileSync(path.join(__dirname,"../templates/launch-hook.js"),launcher);
+  const hook = path.join(codex,"hook.js"); fs.writeFileSync(hook,"process.exit(0)");
+  fs.writeFileSync(path.join(codex,"endpoint.json"),JSON.stringify({rawBodiesDir:raw,rawUploaderDir:path.join(claude,"raw-uploader")}));
+  fs.writeFileSync(path.join(claude,"endpoint.json"),JSON.stringify({rawBodiesDir:raw}));
+  fs.writeFileSync(path.join(codex,"auto-update-state.json"),JSON.stringify({lastAttemptAt:Date.now(),lastResult:"up-to-date"}));
+  const marker = path.join(claude,"called");
+  fs.writeFileSync(path.join(claude,"raw-body-uploader.js"),"require('fs').appendFileSync(require('path').join(__dirname,'called'),'1')");
+  const first = spawnSync(process.execPath,[launcher,hook],{encoding:"utf8",timeout:5000});
+  assert.equal(first.status,0,first.stderr);
+  const deadline = Date.now()+3000;
+  while (!fs.existsSync(marker) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(fs.readFileSync(marker,"utf8"),"1");
+  const state = path.join(claude,"raw-uploader-trigger-state.json");
+  const before = fs.readFileSync(state,"utf8");
+  const second = spawnSync(process.execPath,[launcher,hook],{encoding:"utf8",timeout:5000});
+  assert.equal(second.status,0,second.stderr);
+  assert.equal(fs.readFileSync(state,"utf8"),before);
+  assert.equal(fs.existsSync(path.join(codex,"raw-uploader-trigger-state.json")),false);
+});

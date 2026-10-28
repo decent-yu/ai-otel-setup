@@ -516,3 +516,34 @@ npx -y ai-otel-setup url=你的服务器地址
   通常不需要。只有配置和网络都确认正常、仍无原生 OTel 数据时，再考虑 Claude Code 版本或特殊客户端问题。
 ```
 
+## 十二、raw-bodies 占用过大或快照被跳过
+
+先确认用户安装的是包含磁盘保护修复的版本，并检查 `~/.claude/cc-otel/endpoint.json`：
+
+| 字段 | 默认值 | 作用 |
+|---|---:|---|
+| `rawBodiesHardLimitBytes` | 536870912 | raw、临时文件、sent、discarded 和状态的合计硬清理阈值 |
+| `rawBodiesSoftLimitBytes` / `rawBodiesTargetLimitBytes` | 268435456 | 已上传缓存的回收触发值 / 压力回收目标 |
+| `rawBodiesMinFreeBytes` | 1073741824 | 预留磁盘剩余空间 |
+| `gitSnapshotBundleMaxBytes` | 33554432 | 流式导出字节上限，与文本 diff 截断独立 |
+| `gitSnapshotFileMaxBytes` | 8388608 | 单个改动文件上限 |
+| `gitSnapshotWorkspaceMaxBytes` | 33554432 | 改动文件合计上限 |
+| `gitSnapshotWorkspaceMaxFiles` | 1000 | 改动路径数量上限 |
+| `gitSnapshotMaxRefs` | 256 | 单仓库隐藏快照 ref 上限 |
+
+新配置由安装器写入 Claude 和 Codex 的 endpoint 文件。两者指向同一个 `rawBodiesDir` 和 `rawUploaderDir`。仅替换某一份脚本、但未安装 `spool-storage.js` 不构成完整升级。
+
+观察上传器 `raw-uploader/state.json` 的 `diskGuard.spoolBytes`、`freeBytes`、`lastCleanedFiles` 和文件条目的 `lastError` / `discardReason`；日志事件 `raw_uploader_file_cleaned` 记录回收原因。快照的 `snapshot.capture_status` / `git_snapshot_skipped` 原因包括：
+
+- `workspace_file_too_large` / `workspace_bytes_exceeded` / `workspace_file_count_exceeded`：改动超过预算，排查未忽略的构建产物、大型二进制和数据文件。
+- `bundle_bytes_exceeded` / `bundle_timeout`：导出超过实际字节或时长限制；不会发布半成品。
+- `spool_quota_exceeded`：缓存空间或磁盘预留不足，先检查积压和上传错误。
+- `snapshot_writer_busy`：另一生产者正在工作；本次事件仍上报状态。
+- `snapshot_ref_limit`：已有快照 ref 达到上限，且无法凭上传成功记录安全回收；检查 uploader 是否成功。不要直接清空用户 `.git` 或执行 `git gc --prune=now`。
+
+旧 `.snapshot.bundle.lock` 是 Git 导出的残留数据，不是 `raw-uploader/lock` 的互斥锁。新逻辑统计它们的全部字节，超过 24 小时才回收没有 PID 标识的旧文件；新 `.snapshot-<pid>-<token>.partial` 在生产者仍存活时不会清理。不要对所有 `.lock` 文件一刀切删除，也不要未经校验统一改名上传。
+
+确认定时任务仍在运行。Claude 与 Codex Hook 会唤醒同一个 uploader，并共享一分钟触发节流；未配置上传 URL 时仍可回收缓存。正常文件只有在服务端明确返回 `upload_status=completed`、且返回的校验和匹配时才移至 sent。上传中被截断的文件会报错退避，不会空片死循环。
+
+需要保护尚未上传的历史数据时，应先备份并排查上传失败，再升级；硬阈值或剩余空间不足时会优先保护磁盘并回收最旧稳定待上传文件。此开发任务不会直接清理用户机器的数据。
+

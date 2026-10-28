@@ -47,6 +47,7 @@ test("Codex git snapshot creates a codex bundle and hidden ref", () => {
   fs.mkdirSync(repo, { recursive: true });
   fs.mkdirSync(install, { recursive: true });
   fs.copyFileSync(path.resolve(__dirname, "../templates/git-snapshot.js"), path.join(install, "git-snapshot.js"));
+  fs.copyFileSync(path.resolve(__dirname, "../templates/spool-storage.js"), path.join(install, "spool-storage.js"));
   fs.writeFileSync(path.join(install, "endpoint.json"), JSON.stringify({
     endpoint: "http://127.0.0.1:1",
     fullUpload: true,
